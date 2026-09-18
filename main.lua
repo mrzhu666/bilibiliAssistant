@@ -55,6 +55,13 @@ local o = {
 	live_prefix = "trim",
 	--前缀截断后又空了的弹幕是否丢弃（yes=丢弃该条 / no=保留原文）
 	live_prefix_drop_empty = "yes",
+	--弹幕描边色：black(默认，同点播) / white / RRGGBB。
+	--注意 osd-overlay 默认继承 mpv 的 osd-outline-color（常为近白色），
+	--不覆盖的话黄/蓝等彩色弹幕会被白边糊住发亮，所以这里默认强制黑边。
+	live_outline_color = "black",
+	--彩色弹幕调暗系数(0.3-1.0，1=不调)。黄/蓝等饱和色在亮画面刺眼时可调低。
+	--只作用于彩色弹幕，默认白字不受影响。
+	live_color_dim = "1.0",
 }
 
 options.read_options(o)
@@ -296,16 +303,53 @@ local function live_pos_x(it, now_ms)
 	return it.x1 + (it.x2 - it.x1) * (now_ms - it.born_ms) / it.dur_ms
 end
 
-local function live_emit(parts, it, W, now_ms, font_tag, alpha, outline)
-	local color = ""
-	if it.color ~= "FFFFFF" then
-		color = "\\c&H" .. it.color .. "&"
-		if it.color == "000000" then
-			color = color .. "\\3c&HFFFFFF&" -- 黑字补白边，同 WriteComment
-		end
+-- 弹幕文字色 / 描边色 → ASS 颜色标签。
+-- 关键：必须显式设置描边色 \3c。osd-overlay 继承的是 mpv 的 OSD 样式，
+-- 而 mpv.conf 里 osd-outline-color 常是近白色(#EEEEEE)；若不覆盖，黄/蓝等
+-- 饱和度高的弹幕会被一圈白边糊住、整体发亮贴边。点播 Danmu2Ass 的样式是
+-- 黑色描边(OutlineColour = &H..000000)，这里保持一致。
+-- live_outline_color: black(默认) / white / 十六进制 RRGGBB
+local function live_outline_color_ass()
+	local v = tostring(o.live_outline_color or "black"):lower()
+	if v == "white" then return "FFFFFF" end
+	if v == "black" or v == "" then return "000000" end
+	-- 允许写 RRGGBB，转成 ASS 的 BGR 序
+	local r, g, b = v:match("^(%x%x)(%x%x)(%x%x)$")
+	if r then return (b .. g .. r):upper() end
+	return "000000"
+end
+
+-- 文字色(ASS BGR) + 描边色 → 颜色标签串。
+-- 白色是"默认色"，Danmu2Ass 会跳过它不输出 \c；这里保持一致，
+-- 但仍要显式设置描边色（见上）。
+-- 黑字特例：补白边，否则在黑底上看不见（同 WriteComment）。
+local function live_color_tag(color)
+	local out = ""
+	if color == "000000" then
+		return "\\c&H000000&\\3c&HFFFFFF&"
 	end
+	if color ~= "FFFFFF" then
+		out = "\\c&H" .. color .. "&"
+	end
+	return out .. "\\3c&H" .. live_outline_color_ass() .. "&"
+end
+
+-- 弹幕颜色调暗：只作用于彩色弹幕，默认白字(FFFFFF)保持不变。
+-- 用于黄/蓝等饱和色在亮背景上过于刺眼时。factor 为 RGB 等比缩放系数。
+local function live_dim_color(color, factor)
+	if factor >= 1 then return color end
+	if color == "FFFFFF" then return color end -- 默认色不动
+	-- color 是 ASS 的 BGR 序
+	local b = tonumber(color:sub(1, 2), 16) or 255
+	local g = tonumber(color:sub(3, 4), 16) or 255
+	local r = tonumber(color:sub(5, 6), 16) or 255
+	local function sc(v) return math.floor(v * factor + 0.5) end
+	return string.format("%02X%02X%02X", sc(b), sc(g), sc(r))
+end
+
+local function live_emit(parts, it, W, now_ms, font_tag, alpha, outline)
 	local style = string.format("%s\\fs%d\\b1\\bord%.0f\\shad0\\q2%s%s",
-		font_tag, it.fsize, outline, alpha, color)
+		font_tag, it.fsize, outline, alpha, it.color_tag)
 	if it.fixed then
 		parts[#parts + 1] = string.format("{\\an%d\\pos(%d,%d)%s}%s",
 			it.an, math.floor(W / 2), it.y, style, it.text)
@@ -426,6 +470,9 @@ local function Live_poll()
 		local w = utf8_len(label) * fsize -- 等价 CalculateLength(c) * size
 		local text = live_ass_escape(label)
 		local color = live_convert_color(tonumber(d.color) or 0xffffff, dw, dh)
+		local dim = tonumber(o.live_color_dim) or 1
+		if dim > 0 and dim < 1 then color = live_dim_color(color, dim) end
+		local color_tag = live_color_tag(color)
 		local h = fsize -- 单行弹幕高度
 		if ch == 1 or ch == 2 then
 			local row = live_find_row(ch, h, now_ms, marquee_ms, w, W,
@@ -435,7 +482,7 @@ local function Live_poll()
 			live_mark_row(ch, row, h,
 				{ T = now_ms, len = w, fixed = true, dur = dur_ms })
 			live_items[#live_items + 1] = {
-				text = text, color = color, fsize = fsize,
+				text = text, color_tag = color_tag, fsize = fsize,
 				an = (ch == 1) and 8 or 2, y = y, w = w, fixed = true,
 				born_ms = now_ms, dur_ms = dur_ms, end_ms = now_ms + dur_ms,
 			}
@@ -450,7 +497,7 @@ local function Live_poll()
 			live_mark_row(ch, row, h,
 				{ T = now_ms, len = w, fixed = false, dur = dur_ms })
 			live_items[#live_items + 1] = {
-				text = text, color = color, fsize = fsize,
+				text = text, color_tag = color_tag, fsize = fsize,
 				x1 = x1, x2 = x2, y = row, w = w,
 				born_ms = now_ms, dur_ms = dur_ms, end_ms = now_ms + dur_ms,
 			}

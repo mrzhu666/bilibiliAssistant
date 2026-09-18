@@ -271,6 +271,56 @@ assert(not overlay_data:find("\\c&HFFFFFF&", 1, true),
   "白色不应输出 \\c（Danmu2Ass 会跳过 0xffffff）")
 print("OK: 颜色转换与 Danmu2Ass 一致")
 
+-- ============ 7b. 描边：必须显式用黑边（osd-overlay 默认继承 mpv 近白描边） ============
+-- mpv.conf 的 osd-outline-color 常是近白色，不覆盖会让黄/蓝等彩色弹幕糊住发亮
+FAKE_FILES.jsonl = dm("d", "COLORED", 0xFF0000, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(overlay_data:find("\\3c&H000000&", 1, true),
+  "彩色弹幕未显式设置黑色描边（会继承 mpv 的近白 OSD 描边）")
+-- 黑字必须补白边，否则黑底看不见（同 Danmu2Ass WriteComment）
+FAKE_FILES.jsonl = dm("d", "BLACKTEXT", 0x000000, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(overlay_data:find("\\c&H000000&\\3c&HFFFFFF&", 1, true),
+  "黑字未补白边")
+-- 白色默认弹幕：Danmu2Ass 会跳过 0xffffff，不应输出 \c
+FAKE_FILES.jsonl = dm("d", "PLAINWHITE", 0xFFFFFF, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(not overlay_data:find("\\c&HFFFFFF&", 1, true),
+  "白色弹幕不应输出 \\c（与 Danmu2Ass 一致）")
+print("OK: 描边色显式黑边（黑字补白边、白色不出 \\c）")
+
+-- 描边色可配置
+OPT.live_outline_color = "white"
+FAKE_FILES.jsonl = dm("d", "WOUT", 0xFF0000, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(overlay_data:find("\\3c&HFFFFFF&", 1, true),
+  "live_outline_color=white 未生效")
+OPT.live_outline_color = "black"
+print("OK: live_outline_color 可配置")
+
+-- ============ 7c. 调暗：只作用彩色弹幕，白字不受影响 ============
+-- 纯红 0xFF0000 -> Danmu2Ass 矩阵 0200E9；dim=0.5 -> 010075
+-- 注意 0xE9*0.5=116.5，代码用 floor(x+0.5)=117=0x75（四舍五入，非银行家舍入）
+OPT.live_color_dim = "0.5"
+FAKE_FILES.jsonl = dm("d", "DIMRED", 0xFF0000, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(overlay_data:find("\\c&H010075&", 1, true),
+  "live_color_dim=0.5 未把 0200E9 调暗为 010075，实际: " ..
+  tostring(overlay_data:match("\\c&H%x%x%x%x%x%x&")))
+-- 白字不受调暗影响
+FAKE_FILES.jsonl = dm("d", "DIMWHITE", 0xFFFFFF, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(not overlay_data:find("\\c&H", 1, true),
+  "白字被调暗了（应保持默认色不受影响）")
+OPT.live_color_dim = "1.0"
+print("OK: live_color_dim 只调彩色、不动白字")
+
 -- ============ 8. 固定弹幕 an8/an2 ============
 FAKE_FILES.jsonl = dm("t", "TOP", 16777215, 5, 25) .. "\n"
   .. dm("b", "BOTTOM", 16777215, 4, 25) .. "\n"
