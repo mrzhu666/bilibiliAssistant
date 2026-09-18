@@ -31,10 +31,11 @@ local o = {
 	use_python = true,
 	-- python可执行文件路径，默认为环境变量的python，若无法运行请指定 python[.exe] 的路径
 	python_path = "python",
-	--直播弹幕轮询 jsonl 的间隔（秒）
-	live_interval = "0.1",
-	--直播同屏滚动弹幕上限（超出后仍会按行补位，绝不重叠）
-	live_max = "40",
+	--直播弹幕重绘间隔（秒）：\pos 推进靠它，0.05=20fps。
+	--低于 0.03 收益递减且 CPU 上涨；高于 0.1 会有肉眼可见的阶梯感
+	live_interval = "0.05",
+	--是否启用直播弹幕（播放 live.bilibili.com 时生效）
+	live_enable = "yes",
 	--手动指定直播间号（留空则从播放地址自动识别 live.bilibili.com/<号>）
 	live_room = "",
 	--直播弹幕读完后是否截断 jsonl（yes=已播弹幕直接删除，不囤积）
@@ -52,17 +53,26 @@ local sec_sub_ass_override = mp.get_property_native("secondary-sub-ass-override"
 local log
 
 -- ============ B站直播实时弹幕 ============
+-- 显示规则严格对齐点播 Danmu2Ass，保证与点播弹幕长得一样、动得一样：
+--   1) PlayRes 按视频宽高比推导（与 main.lua 传给 -s 的 dw x dh 同一算法）
+--   2) percent 语义完全相同：bottomReserved = percent * dh，弹幕只排上方 dh 以内
+--   3) 4 条通道（0 滚动 / 1 顶部固定 / 2 底部固定 / 3 逆向滚动）+ 像素行占用 +
+--      追尾判定，等价于 TestFreeRows / MarkCommentRow
+--   4) 字号沿用 B站语义（25 为标准）：fsize = fontsize * size / 25
+-- 注意：osd-overlay 的 event 时间被 mpv 写死（Start=0 / Duration=100ms，且恒以
+-- ts=0 渲染），因此 Start/End 与 \move 都不会生效——位置只能用 \pos 高频重绘推进。
 local live_cmd = nil      -- subprocess 句柄（可 abort）
 local live_file = nil     -- jsonl 路径
 local live_overlay = nil  -- osd overlay
-local live_timer = nil    -- 轮询 timer
+local live_timer = nil    -- 轮询/重绘 timer
 local live_offset = 0     -- jsonl 已读字节数
-local live_items = {}     -- 在屏弹幕列表 {text, ass_color, birth, dur, spd, w, vw, row, y}
-local live_rows = {}      -- row -> 该行最后一条弹幕（用于防重叠/追尾）
+local live_items = {}     -- 在屏弹幕
+local live_chan = {}      -- 通道占用表：live_chan[ch][pixel_row] = occ
 local live_visible = true
 local live_room = nil
 
 local function get_live_room()
+	if o.live_enable ~= "yes" then return nil end
 	local room = mp.get_opt("live_room")
 	if room and room ~= "" then
 		local manual = room:match("(%d+)")
@@ -85,27 +95,51 @@ local function get_live_room()
 	return nil
 end
 
--- Lua 5.1 无 utf8 库，手动数 UTF-8 字符（估算弹幕宽度用）
+-- Lua 5.1 无 utf8 库，手动数 UTF-8 字符（等价 Danmu2Ass 的 CalculateLength）
 local function utf8_len(s)
 	local _, n = s:gsub("[^\128-\191]", "")
 	return n
 end
 
-local function live_color_ass(color)
-	color = tonumber(color) or 0xffffff
-	local r = math.floor(color / 65536) % 256
-	local g = math.floor(color / 256) % 256
-	local b = color % 256
-	return string.format("%02X%02X%02X", b, g, r) -- ASS 是 BGR 序
+-- 与 Danmu2Ass ConvertColor 逐字一致。
+-- 注意：返回值本身就是 ASS 的 &HBBGGRR& 顺序（即 BT.601→BT.709 矩阵输出的
+-- 三行依次填入 BB/GG/RR），不要再自行换序，否则颜色会整体错位。
+-- 小画布(width<1280 且 height<576)时段点播走的是不做矩阵的直通分支，
+-- 这里同样保留，保证与点播一致。
+local function live_convert_color(rgb, width, height)
+	local r = math.floor(rgb / 65536) % 256
+	local g = math.floor(rgb / 256) % 256
+	local b = rgb % 256
+	if width < 1280 and height < 576 then
+		return string.format("%02X%02X%02X", b, g, r)
+	end
+	local function clip(x)
+		if x > 255 then return 255 elseif x < 0 then return 0 end
+		return math.floor(x + 0.5)
+	end
+	return string.format("%02X%02X%02X",
+		clip(r * 0.00956384088080656 + g * 0.03217254540203729
+			+ b * 0.95826361371715607),
+		clip(r * -0.10493933142075390 + g * 1.17231478191855154
+			+ b * -0.06737545049779757),
+		clip(r * 0.91348912373987645 + g * 0.07858536372532510
+			+ b * 0.00792551253479842))
 end
 
 local function live_ass_escape(s)
-	-- ASS 里 { } 是特效块，\ 是转义符；弹幕内换行会破坏 overlay 行结构
+	-- 换行会破坏 overlay 的“一行一条”结构，先压平
 	s = s:gsub("[\r\n]", " ")
 	return s:gsub("\\", "\\\\"):gsub("{", "\\{"):gsub("}", "\\}")
 end
 
--- 透明度 → ASS \alpha 值（&Hxx&，00=不透明，FF=全透明）
+-- 字体名转 ASS（与点播一样用 fontname；逗号前截断防注入）
+local function live_font_tag()
+	local fn = tostring(o.fontname or "sans-serif"):match("^[^,]*") or "sans-serif"
+	fn = fn:gsub("\\", "\\\\"):gsub("{", "\\{"):gsub("}", "\\}")
+	return "\\fn" .. fn
+end
+
+-- 透明度 → ASS \alpha（&Hxx&，00=不透明，FF=全透明）
 local function live_alpha_tag()
 	local op = tonumber(o.opacity) or 1
 	if op < 0 then op = 0 elseif op > 1 then op = 1 end
@@ -114,80 +148,132 @@ local function live_alpha_tag()
 	return string.format("\\alpha&H%02X&", a)
 end
 
--- 虚拟画布：高度固定 1080，宽度按视频宽高比推导（与 Danmu2Ass 一致）。
--- overlay 的 res_x/res_y 会成为 ASS PlayResX/PlayResY，libass 会自动缩放到窗口，
--- 因此这里只需按 1080p 坐标计算，无需关心真实 OSD 像素。
+-- 画布与点播一致：PlayRes 按视频宽高比推导；bottomReserved = percent * dh。
+-- overlay 的 res_x/res_y 即 PlayResX/PlayResY，libass 负责缩放到实际窗口。
 local function live_layout()
 	local w = mp.get_property_number("width", 0) or 0
 	local h = mp.get_property_number("height", 0) or 0
-	local aspect = (w > 0 and h > 0) and (w / h) or (16 / 9)
-	local vh = 1080
-	local vw = math.max(1, math.floor(vh * aspect))
-	-- 直接套用点播弹幕的样式：字号、底部留白比例
+	local dw, dh = 1920, 1080
+	if w > 0 and h > 0 then
+		local aspect = w / h
+		if aspect > dw / dh then
+			dh = math.floor(dw / aspect)
+		elseif aspect < dw / dh then
+			dw = math.floor(dh * aspect)
+		end
+	end
 	local fs = tonumber(o.fontsize) or 50
-	local line_h = math.max(1, math.floor(fs * 1.35))
-	local pct = tonumber(o.percent) or 0.85
-	if pct <= 0 or pct > 1 then pct = 0.85 end
-	local max_rows = math.max(1, math.floor(vh * pct / line_h))
-	return vw, vh, fs, line_h, max_rows
+	local pct = tonumber(o.percent) or 0.75
+	if pct < 0 then pct = 0 elseif pct > 1 then pct = 1 end
+	local bottom_reserved = math.floor(pct * dh)
+	local area_bottom = dh - bottom_reserved -- 弹幕可用区域下边界（像素）
+	return dw, dh, fs, bottom_reserved, area_bottom
 end
 
--- 每条弹幕从右边缘 vw 匀速移到左边缘外 -w，用时 dur。
--- 位置只由 birth/spd 推出，渲染与排版共用同一套坐标，避免漂移。
-local function live_x(it, now)
-	return it.vw - (now - it.birth) * it.spd
+-- 通道占用项：{T=出生毫秒, len=像素长度, fixed=是否固定, dur=自身显示时长}
+-- 判空完全按 TestFreeRows：
+--   固定：上一条显示结束本行才空（t - T >= duration_still）
+--   滚动：t - T >= duration_marquee * L / (L + W)，L = max(本条, 上一条) 长度，
+--         一条式子同时覆盖“上一条已完全进屏”和“这条追不上上一条”
+local function live_occ_free(occ, t, dur_ms, new_len, W, still_ms)
+	if not occ then return true end
+	if occ.fixed then return (t - occ.T) >= still_ms end
+	local L = new_len > occ.len and new_len or occ.len
+	return (t - occ.T) >= dur_ms * L / (L + W)
+end
+
+local function live_find_row(ch, h, t, dur_ms, new_len, W, area_bottom, still_ms, fixed)
+	if not live_chan[ch] then live_chan[ch] = {} end
+	local arr = live_chan[ch]
+	local nrow = math.ceil(h)
+	local row = 0
+	while row + nrow <= area_bottom do
+		local ok = true
+		for r = row, row + nrow - 1 do
+			if not live_occ_free(arr[r], t, dur_ms, new_len, W, still_ms) then
+				ok = false
+				break
+			end
+		end
+		if ok then return row end
+		row = row + 1
+	end
+	return nil
+end
+
+local function live_mark_row(ch, row, h, occ)
+	if not live_chan[ch] then live_chan[ch] = {} end
+	local arr = live_chan[ch]
+	for i = row, row + math.ceil(h) - 1 do
+		arr[i] = occ
+	end
+end
+
+-- 清掉“整条早就放完”的占用项，避免占用表无限增长
+local function live_sweep(t)
+	for ch = 0, 3 do
+		local arr = live_chan[ch]
+		if arr then
+			for r, occ in pairs(arr) do
+				if (t - occ.T) >= occ.dur then arr[r] = nil end
+			end
+		end
+	end
+end
+
+-- 单条弹幕的当前横坐标（毫秒整数推进，避免浮点漂移）
+local function live_pos_x(it, now_ms)
+	return it.x1 + (it.x2 - it.x1) * (now_ms - it.born_ms) / it.dur_ms
+end
+
+local function live_emit(parts, it, W, now_ms, font_tag, alpha, outline)
+	local color = ""
+	if it.color ~= "FFFFFF" then
+		color = "\\c&H" .. it.color .. "&"
+		if it.color == "000000" then
+			color = color .. "\\3c&HFFFFFF&" -- 黑字补白边，同 WriteComment
+		end
+	end
+	local style = string.format("%s\\fs%d\\b1\\bord%.0f\\shad0\\q2%s%s",
+		font_tag, it.fsize, outline, alpha, color)
+	if it.fixed then
+		parts[#parts + 1] = string.format("{\\an%d\\pos(%d,%d)%s}%s",
+			it.an, math.floor(W / 2), it.y, style, it.text)
+	else
+		local x = math.floor(live_pos_x(it, now_ms))
+		if x + it.w >= 0 then -- 左边界裁剪；右侧出屏部分交给 libass 裁掉
+			parts[#parts + 1] = string.format("{\\an7\\pos(%d,%d)%s}%s",
+				x, it.y, style, it.text)
+		end
+	end
 end
 
 local function Live_render()
 	if not live_overlay then return end
+	local dw, dh, fs = live_layout()
 	if not live_visible then
 		live_overlay.data = ""
-		live_overlay.res_x = 1920
-		live_overlay.res_y = 1080
+		live_overlay.res_x = dw
+		live_overlay.res_y = dh
 		live_overlay:update()
 		return
 	end
-	local vw, vh, fs, _line_h, max_rows = live_layout()
+	local font_tag = live_font_tag()
 	local alpha = live_alpha_tag()
-	local now = mp.get_time() -- wall clock：平滑且不受直播重连重置 time-pos 影响
-	-- 渲染顺带做过期清理：播出过期的当场剔除，不囤积
-	local fresh = {}
+	local outline = math.max(fs / 25, 1) -- 同 WriteASSHead 的 outline
+	local now_ms = math.floor(mp.get_time() * 1000 + 0.5)
+	-- 过期清理：显示期一过就剔除，不囤积
+	local fresh, parts = {}, {}
 	for _, it in ipairs(live_items) do
-		if now >= it.birth - 1 and now < it.birth + it.dur then
+		if now_ms < it.end_ms then
 			fresh[#fresh + 1] = it
+			live_emit(parts, it, dw, now_ms, font_tag, alpha, outline)
 		end
 	end
 	live_items = fresh
-	local parts = {}
-	for _, it in ipairs(live_items) do
-		local fz = it.fsize or fs
-		if it.fixed then
-			-- 顶部/底部固定弹幕：居中静止显示
-			parts[#parts + 1] = string.format(
-				"{\\an8\\pos(%d,%d)\\fs%d\\bord2%s\\1c&H%s&}%s",
-				math.floor(vw / 2), it.y, fz, alpha, it.ass_color, it.text)
-		elseif it.row < max_rows then
-			local x, show
-			if it.spd < 0 then
-				-- 逆向滚动：从左边缘外向右走
-				x = it.x0 + (now - it.birth) * (-it.spd)
-				show = (x <= vw) -- 右边缘还没完全出屏
-			else
-				x = live_x(it, now)
-				show = true
-			end
-			-- 只做左边界裁剪：右侧刚出生仍在外面的直接交给 libass 裁掉，
-			-- 这样弹幕一进屏就是连续的，不会延迟一个 tick 才出现。
-			if show and x + it.w >= 0 then
-				parts[#parts + 1] = string.format(
-					"{\\an7\\pos(%d,%d)\\fs%d\\bord2%s\\1c&H%s&}%s",
-					math.floor(x), it.y, fz, alpha, it.ass_color, it.text)
-			end
-		end
-	end
 	live_overlay.data = table.concat(parts, "\n")
-	live_overlay.res_x = vw   -- 与虚拟画布一致，libass 再缩放到实际窗口
-	live_overlay.res_y = vh
+	live_overlay.res_x = dw
+	live_overlay.res_y = dh
 	live_overlay:update()
 end
 
@@ -205,8 +291,8 @@ local function Live_poll()
 	local complete = chunk:sub(1, last_nl)
 	live_offset = live_offset + last_nl
 	-- 已播弹幕直接删除：把未消费的剩余半行回写，其余截掉，防止 jsonl 无限增长。
-	-- 注意截断后文件内容就是剩余半行本身，所以偏移必须归零（不能沿用旧偏移，
-	-- 否则下次会从半行中间开始读，拼出来的行永远是坏的）。
+	-- 截断后文件内容就是剩余半行本身，所以偏移必须归零，否则下次会从半行
+	-- 中间开始读，拼出来的行永远是坏的。
 	if mp.get_opt("live_trim") ~= "no" then
 		local rest = chunk:sub(last_nl + 1)
 		local wf = io.open(live_file, "w")
@@ -216,80 +302,59 @@ local function Live_poll()
 		end
 		live_offset = 0
 	end
-	local now = mp.get_time() -- wall clock：稳定递增，不受直播流 time-pos 跳变影响
-	local vw, _vh, fs, line_h, max_rows = live_layout()
-	-- 直接套用点播弹幕的滚动时长，保证观感一致
-	local marquee = tonumber(o.duration_marquee) or 10
-	if marquee < 1 then marquee = 1 end
-	local max_items = tonumber(o.live_max) or 40
-	-- 每个弹幕行只记最后一条（用于判断能否再放）
-	local function can_place(last, w, spd)
-		if not last then return true end
-		local px = live_x(last, now)              -- 上一条左边缘
-		if px + last.w > vw then return false end -- 还没完全进屏，让一让
-		if spd <= last.spd then return true end   -- 不更快就不会追尾
-		-- 更快：算追尾时刻，晚于它离屏就安全
-		local t_hit = now + (vw - (px + last.w)) / (spd - last.spd)
-		return t_hit > last.birth + last.dur
-	end
+	local dw, dh, fs, _br, area_bottom = live_layout()
+	local W = dw
+	local marquee_ms = (tonumber(o.duration_marquee) or 10) * 1000
+	if marquee_ms < 1000 then marquee_ms = 1000 end
+	local still_ms = (tonumber(o.duration_still) or 5) * 1000
+	if still_ms < 1000 then still_ms = 1000 end
+	local now_ms = math.floor(mp.get_time() * 1000 + 0.5)
+	live_sweep(now_ms)
+	local MODE2CH = { [1] = 0, [4] = 2, [5] = 1, [6] = 3 }
 	local function keep_line(line)
 		local ok, d = pcall(utils.parse_json, line)
-		if ok and d and d.text then
-			local label = d.user .. "：" .. d.text
-			local dur = marquee
-			if d.type == "sc" then
-				label = string.format("[SC ¥%s]%s：%s",
-					tostring(d.price or "?"), d.user, d.text)
-				-- SC 沿用静止弹幕时长（翻倍以示醒目）
-				dur = (tonumber(o.duration_still) or 5) * 2
-			end
-			local w = math.max(40, math.floor(utf8_len(label) * fs * 0.62))
-			-- 字号沿用 B站语义（25 为标准），按 Danmu2Ass 规则换算：
-			-- mode 4=底部 5=顶部固定，其余为滚动；1=滚动 6=逆向
-			local mmode = tonumber(d.mode) or 1
-			local ssize = tonumber(d.size) or 25
-			local fontsize = math.floor(fs * ssize / 25 + 0.5)
-			if mmode == 4 or mmode == 5 then
-				-- 底部/顶部固定：y 打在屏上下固定位置，x 居中
-				local y = (mmode == 5) and math.floor(fontsize / 2)
-					or (1080 - math.floor(fontsize / 2))
-				if #live_items >= max_items then
-					table.remove(live_items, 1) -- 维持上限：丢最旧的
-				end
-				live_items[#live_items + 1] = {
-					text = live_ass_escape(label),
-					ass_color = live_color_ass(d.color),
-					birth = now, dur = dur, spd = 0, w = w, vw = vw,
-					row = max_rows, y = y, fixed = true,
-					fsize = fontsize,
-				}
-			else
-				local spd = (vw + w) / dur
-				-- 选一个能放的行；放不下就丢弃（保证不重叠、不追尾）
-				local row = nil
-				for r = 0, max_rows - 1 do
-					if can_place(live_rows[r], w, spd) then row = r break end
-				end
-				if row ~= nil then
-					if #live_items >= max_items then
-						table.remove(live_items, 1) -- 维持上限：丢最旧的
-					end
-					local it = {
-						text = live_ass_escape(label),
-						ass_color = live_color_ass(d.color),
-						birth = now, dur = dur, spd = spd, w = w, vw = vw,
-						row = row, y = row * line_h + line_h / 2,
-						fsize = fontsize,
-					}
-					if mmode == 6 then
-						-- 逆向滚动：从左向右走
-						it.spd = -spd
-						it.x0 = -w
-					end
-					live_rows[row] = it
-					live_items[#live_items + 1] = it
-				end
-			end
+		if not (ok and d and d.text) then return end
+		local label = d.user .. "：" .. d.text
+		local dur_ms = marquee_ms
+		if d.type == "sc" then
+			label = string.format("[SC ¥%s]%s：%s",
+				tostring(d.price or "?"), d.user, d.text)
+			dur_ms = still_ms * 2 -- SC 借用静止时长翻倍，醒目
+		end
+		local ch = MODE2CH[tonumber(d.mode) or 1] or 0
+		local ssize = tonumber(d.size) or 25
+		local fsize = math.floor(fs * ssize / 25 + 0.5)
+		local w = utf8_len(label) * fsize -- 等价 CalculateLength(c) * size
+		local text = live_ass_escape(label)
+		local color = live_convert_color(tonumber(d.color) or 0xffffff, dw, dh)
+		local h = fsize -- 单行弹幕高度
+		if ch == 1 or ch == 2 then
+			local row = live_find_row(ch, h, now_ms, marquee_ms, w, W,
+				area_bottom, still_ms, true)
+			if row == nil then return end -- 排不下就丢弃，保证不重叠
+			local y = (ch == 1) and row or (area_bottom - row) -- an8 顶 / an2 底
+			live_mark_row(ch, row, h,
+				{ T = now_ms, len = w, fixed = true, dur = dur_ms })
+			live_items[#live_items + 1] = {
+				text = text, color = color, fsize = fsize,
+				an = (ch == 1) and 8 or 2, y = y, w = w, fixed = true,
+				born_ms = now_ms, dur_ms = dur_ms, end_ms = now_ms + dur_ms,
+			}
+		else
+			local reverse = (ch == 3)
+			-- 正向 W→-w，逆向 -w→W（对应 WriteComment 的 \move 起点终点）
+			local x1 = reverse and -w or W
+			local x2 = reverse and W or -w
+			local row = live_find_row(ch, h, now_ms, marquee_ms, w, W,
+				area_bottom, still_ms, false)
+			if row == nil then return end
+			live_mark_row(ch, row, h,
+				{ T = now_ms, len = w, fixed = false, dur = dur_ms })
+			live_items[#live_items + 1] = {
+				text = text, color = color, fsize = fsize,
+				x1 = x1, x2 = x2, y = row, w = w,
+				born_ms = now_ms, dur_ms = dur_ms, end_ms = now_ms + dur_ms,
+			}
 		end
 	end
 	for line in complete:gmatch("[^\r\n]+") do keep_line(line) end
@@ -308,7 +373,7 @@ local function Live_start(room)
 	live_file = utils.join_path(tmpdir, "bilibili-live-" .. room .. ".jsonl")
 	live_offset = 0
 	live_items = {}
-	live_rows = {}
+	live_chan = {}
 	live_visible = true
 	live_overlay = mp.create_osd_overlay("ass-events")
 	live_cmd = mp.command_native_async({
@@ -324,7 +389,7 @@ local function Live_start(room)
 		end
 	end)
 	live_timer = mp.add_periodic_timer(
-		tonumber(o.live_interval) or 0.1, Live_poll)
+		tonumber(o.live_interval) or 0.05, Live_poll)
 	log("直播间 " .. room .. " 实时弹幕已启动，按 b 切换显示")
 end
 
@@ -339,7 +404,7 @@ function Live_stop()
 	if live_file then
 		pcall(os.remove, live_file)
 	end
-	live_items, live_rows = {}, {}
+	live_items, live_chan = {}, {}
 	live_offset, live_file, live_room = 0, nil, nil
 	live_visible = true
 end
