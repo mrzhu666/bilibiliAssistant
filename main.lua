@@ -55,13 +55,12 @@ local o = {
 	live_prefix = "trim",
 	--前缀截断后又空了的弹幕是否丢弃（yes=丢弃该条 / no=保留原文）
 	live_prefix_drop_empty = "yes",
-	--弹幕描边色：black(默认，同点播) / white / RRGGBB。
-	--注意 osd-overlay 默认继承 mpv 的 osd-outline-color（常为近白色），
-	--不覆盖的话黄/蓝等彩色弹幕会被白边糊住发亮，所以这里默认强制黑边。
-	live_outline_color = "black",
-	--彩色弹幕调暗系数(0.3-1.0，1=不调)。黄/蓝等饱和色在亮画面刺眼时可调低。
-	--只作用于彩色弹幕，默认白字不受影响。
-	live_color_dim = "1.0",
+	--弹幕描边色：default(默认，不覆盖，继承 mpv 的 osd-outline-color 白边)
+	--black / white / RRGGBB 可显式指定；想让彩色弹幕更清爽可设 black
+	live_outline_color = "default",
+	--彩色弹幕调暗系数(0.3-1.0，1=不调)。黄/蓝等饱和色发亮刺眼时调低即可。
+	--只作用于彩色弹幕，默认白字(FFFFFF)与黑字不受影响。
+	live_color_dim = "0.75",
 }
 
 options.read_options(o)
@@ -304,34 +303,37 @@ local function live_pos_x(it, now_ms)
 end
 
 -- 弹幕文字色 / 描边色 → ASS 颜色标签。
--- 关键：必须显式设置描边色 \3c。osd-overlay 继承的是 mpv 的 OSD 样式，
--- 而 mpv.conf 里 osd-outline-color 常是近白色(#EEEEEE)；若不覆盖，黄/蓝等
--- 饱和度高的弹幕会被一圈白边糊住、整体发亮贴边。点播 Danmu2Ass 的样式是
--- 黑色描边(OutlineColour = &H..000000)，这里保持一致。
--- live_outline_color: black(默认) / white / 十六进制 RRGGBB
+-- 描边默认 "default"：不输出 \3c，直接继承 mpv 的 OSD 样式
+-- （即 mpv.conf 的 osd-outline-color，本机为近白 #EEEEEE），保持原生观感。
+-- 若想让彩色弹幕更清爽，可设 live_outline_color=black（点播 Danmu2Ass 即黑边）。
+-- live_outline_color: default / black / white / RRGGBB
 local function live_outline_color_ass()
-	local v = tostring(o.live_outline_color or "black"):lower()
+	local v = tostring(o.live_outline_color or "default"):lower()
+	if v == "default" or v == "" then return nil end
 	if v == "white" then return "FFFFFF" end
-	if v == "black" or v == "" then return "000000" end
+	if v == "black" then return "000000" end
 	-- 允许写 RRGGBB，转成 ASS 的 BGR 序
 	local r, g, b = v:match("^(%x%x)(%x%x)(%x%x)$")
 	if r then return (b .. g .. r):upper() end
-	return "000000"
+	return nil
 end
 
 -- 文字色(ASS BGR) + 描边色 → 颜色标签串。
--- 白色是"默认色"，Danmu2Ass 会跳过它不输出 \c；这里保持一致，
--- 但仍要显式设置描边色（见上）。
+-- 白色是"默认色"，Danmu2Ass 会跳过它不输出 \c；这里保持一致。
 -- 黑字特例：补白边，否则在黑底上看不见（同 WriteComment）。
 local function live_color_tag(color)
 	local out = ""
-	if color == "000000" then
-		return "\\c&H000000&\\3c&HFFFFFF&"
-	end
 	if color ~= "FFFFFF" then
 		out = "\\c&H" .. color .. "&"
 	end
-	return out .. "\\3c&H" .. live_outline_color_ass() .. "&"
+	if color == "000000" then
+		return out .. "\\3c&HFFFFFF&"
+	end
+	local oc = live_outline_color_ass()
+	if oc then
+		out = out .. "\\3c&H" .. oc .. "&"
+	end
+	return out
 end
 
 -- 弹幕颜色调暗：只作用于彩色弹幕，默认白字(FFFFFF)保持不变。

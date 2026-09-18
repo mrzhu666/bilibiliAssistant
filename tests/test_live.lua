@@ -250,10 +250,12 @@ timer.fn()
 assert(overlay_data:find("\\fs100", 1, true), "size=50 未换算为 fs100")
 print("OK: 字号换算 size*fontsize/25 生效")
 
--- ============ 7. 颜色：与 Danmu2Ass ConvertColor 逐字一致 ============
+-- ============ 7. 颜色矩阵：与 Danmu2Ass ConvertColor 逐字一致 ============
 -- 真 Danmu2Ass 对这些 B站 0xRRGGBB 的输出（已实测）：
 --   0xFF0000 -> 0200E9   0x00FF00 -> 08FF14   0x0000FF -> F40002
 --   0xFFFFFF -> FFFFFF
+-- 注意：这里只测转换矩阵本身，所以先关掉彩色调暗（否则会被 dim 影响）
+OPT.live_color_dim = "1.0"
 FAKE_FILES.jsonl = dm("c", "RED", 0xFF0000, 1, 25) .. "\n"
 FAKE_TIME = FAKE_TIME + 60
 timer.fn()
@@ -269,57 +271,70 @@ FAKE_TIME = FAKE_TIME + 60
 timer.fn()
 assert(not overlay_data:find("\\c&HFFFFFF&", 1, true),
   "白色不应输出 \\c（Danmu2Ass 会跳过 0xffffff）")
+OPT.live_color_dim = "0.75" -- 恢复默认
 print("OK: 颜色转换与 Danmu2Ass 一致")
 
--- ============ 7b. 描边：必须显式用黑边（osd-overlay 默认继承 mpv 近白描边） ============
--- mpv.conf 的 osd-outline-color 常是近白色，不覆盖会让黄/蓝等彩色弹幕糊住发亮
-FAKE_FILES.jsonl = dm("d", "COLORED", 0xFF0000, 1, 25) .. "\n"
+-- ============ 7b. 描边：默认继承 mpv OSD（不输出 \3c），可选显式指定 ============
+-- 用户要求"恢复默认白边"：default 时应保持 mpv 原生 OSD 描边，不覆盖
+assert((OPT.live_outline_color or "default") == "default",
+  "默认描边应为 default（继承 mpv OSD）")
+FAKE_FILES.jsonl = dm("d", "NOOUTLINE", 0xFF0000, 1, 25) .. "\n"
 FAKE_TIME = FAKE_TIME + 60
 timer.fn()
-assert(overlay_data:find("\\3c&H000000&", 1, true),
-  "彩色弹幕未显式设置黑色描边（会继承 mpv 的近白 OSD 描边）")
--- 黑字必须补白边，否则黑底看不见（同 Danmu2Ass WriteComment）
+assert(not overlay_data:find("\\3c", 1, true),
+  "default 描边不应输出 \\3c（应继承 mpv 的 osd-outline-color）")
+assert(overlay_data:find("\\c&H", 1, true), "彩色弹幕应输出文字色 \\c")
+-- 黑字特例：必须补白边，与描边设置无关（否则黑底看不见）
 FAKE_FILES.jsonl = dm("d", "BLACKTEXT", 0x000000, 1, 25) .. "\n"
 FAKE_TIME = FAKE_TIME + 60
 timer.fn()
 assert(overlay_data:find("\\c&H000000&\\3c&HFFFFFF&", 1, true),
   "黑字未补白边")
--- 白色默认弹幕：Danmu2Ass 会跳过 0xffffff，不应输出 \c
+-- 白色默认弹幕：Danmu2Ass 跳过 0xffffff，不应输出 \c
 FAKE_FILES.jsonl = dm("d", "PLAINWHITE", 0xFFFFFF, 1, 25) .. "\n"
 FAKE_TIME = FAKE_TIME + 60
 timer.fn()
 assert(not overlay_data:find("\\c&HFFFFFF&", 1, true),
   "白色弹幕不应输出 \\c（与 Danmu2Ass 一致）")
-print("OK: 描边色显式黑边（黑字补白边、白色不出 \\c）")
+print("OK: 描边默认继承 mpv OSD（黑字补白边、白色不出 \\c）")
 
--- 描边色可配置
-OPT.live_outline_color = "white"
-FAKE_FILES.jsonl = dm("d", "WOUT", 0xFF0000, 1, 25) .. "\n"
+-- 显式指定描边色仍可用（可选增强）
+OPT.live_outline_color = "black"
+FAKE_FILES.jsonl = dm("d", "BOUT", 0xFF0000, 1, 25) .. "\n"
 FAKE_TIME = FAKE_TIME + 60
 timer.fn()
-assert(overlay_data:find("\\3c&HFFFFFF&", 1, true),
-  "live_outline_color=white 未生效")
-OPT.live_outline_color = "black"
-print("OK: live_outline_color 可配置")
+assert(overlay_data:find("\\3c&H000000&", 1, true),
+  "live_outline_color=black 未生效")
+OPT.live_outline_color = "default"
+print("OK: live_outline_color 可选指定（black/white/RRGGBB）")
 
--- ============ 7c. 调暗：只作用彩色弹幕，白字不受影响 ============
--- 纯红 0xFF0000 -> Danmu2Ass 矩阵 0200E9；dim=0.5 -> 010075
--- 注意 0xE9*0.5=116.5，代码用 floor(x+0.5)=117=0x75（四舍五入，非银行家舍入）
-OPT.live_color_dim = "0.5"
+-- ============ 7c. 调暗：默认开启，只作用彩色弹幕，白字不受影响 ============
+-- 纯红 0xFF0000 -> Danmu2Ass 矩阵 0200E9
+-- 0.75: 0x02*0.75=1.5->2, 0xE9*0.75=174.75->175=0xAF  => 0200AF
+local dim = tonumber(OPT.live_color_dim or 1)
+assert(dim > 0 and dim < 1, "默认应开启彩色调暗，实际 live_color_dim="
+  .. tostring(OPT.live_color_dim))
 FAKE_FILES.jsonl = dm("d", "DIMRED", 0xFF0000, 1, 25) .. "\n"
 FAKE_TIME = FAKE_TIME + 60
 timer.fn()
-assert(overlay_data:find("\\c&H010075&", 1, true),
-  "live_color_dim=0.5 未把 0200E9 调暗为 010075，实际: " ..
-  tostring(overlay_data:match("\\c&H%x%x%x%x%x%x&")))
--- 白字不受调暗影响
+local got = overlay_data:match("\\c&H(%x%x%x%x%x%x)&")
+print("  红色调暗后: " .. tostring(got))
+assert(got and got < "0200E9", "彩色弹幕未被调暗: " .. tostring(got))
+assert(got ~= "0200E9", "调暗系数无效")
+-- 白字不受调暗影响（默认白字应保持不输出 \c）
 FAKE_FILES.jsonl = dm("d", "DIMWHITE", 0xFFFFFF, 1, 25) .. "\n"
 FAKE_TIME = FAKE_TIME + 60
 timer.fn()
 assert(not overlay_data:find("\\c&H", 1, true),
-  "白字被调暗了（应保持默认色不受影响）")
+  "白字被调暗/染色了（应保持默认色不受影响）")
+-- dim=1.0 时完全还原
 OPT.live_color_dim = "1.0"
-print("OK: live_color_dim 只调彩色、不动白字")
+FAKE_FILES.jsonl = dm("d", "NODIM", 0xFF0000, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(overlay_data:find("\\c&H0200E9&", 1, true),
+  "live_color_dim=1.0 时未还原为原色")
+print("OK: live_color_dim 默认开启、只调彩色、白字不受影响")
 
 -- ============ 8. 固定弹幕 an8/an2 ============
 FAKE_FILES.jsonl = dm("t", "TOP", 16777215, 5, 25) .. "\n"
