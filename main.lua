@@ -31,9 +31,11 @@ local o = {
 	use_python = true,
 	-- python可执行文件路径，默认为环境变量的python，若无法运行请指定 python[.exe] 的路径
 	python_path = "python",
-	--直播弹幕重绘间隔（秒）：\pos 推进靠它，0.05=20fps。
-	--低于 0.03 收益递减且 CPU 上涨；高于 0.1 会有肉眼可见的阶梯感
-	live_interval = "0.05",
+	--直播弹幕读取 jsonl 的间隔（秒）。只负责“收弹幕”，与流畅度无关：
+	--画面推进走 time-pos 逐帧重绘，见 live_on_tick
+	live_ingest = "0.2",
+	--直播同屏弹幕上限（防超高密度房间让每帧拼串开销失控）
+	live_max = "60",
 	--是否启用直播弹幕（播放 live.bilibili.com 时生效）
 	live_enable = "yes",
 	--手动指定直播间号（留空则从播放地址自动识别 live.bilibili.com/<号>）
@@ -59,17 +61,25 @@ local log
 --   3) 4 条通道（0 滚动 / 1 顶部固定 / 2 底部固定 / 3 逆向滚动）+ 像素行占用 +
 --      追尾判定，等价于 TestFreeRows / MarkCommentRow
 --   4) 字号沿用 B站语义（25 为标准）：fsize = fontsize * size / 25
--- 注意：osd-overlay 的 event 时间被 mpv 写死（Start=0 / Duration=100ms，且恒以
--- ts=0 渲染），因此 Start/End 与 \move 都不会生效——位置只能用 \pos 高频重绘推进。
+-- 为什么不能用 \move：osd-overlay 的 event 时间被 mpv 写死
+-- （sub/osd_libass.c: event->Start=0; event->Duration=100; 且渲染恒为
+-- ass_render_frame(..., ts=0, ...)），所以 Start/End / \move 都不生效，
+-- 位置只能在 Lua 侧算好再用 \pos 出来。
+--
+-- 为什么逐帧重绘不额外费性能：mpv 本来就是每显示一帧就对 OSD overlay
+-- 重新跑一遍 libass（osd_object_get_bitmaps → append_ass），我们更新 data
+-- 不增加 libass 渲染次数，只多一点拼字符串。因此这里挂 time-pos 让视频帧
+-- 驱动重绘：视频出帧才重画，既不空转，又是帧级精确（等同点播 \move 的手感）。
 local live_cmd = nil      -- subprocess 句柄（可 abort）
 local live_file = nil     -- jsonl 路径
 local live_overlay = nil  -- osd overlay
-local live_timer = nil    -- 轮询/重绘 timer
+local live_timer = nil    -- 读取 jsonl 的定时器（与流畅度无关）
 local live_offset = 0     -- jsonl 已读字节数
 local live_items = {}     -- 在屏弹幕
 local live_chan = {}      -- 通道占用表：live_chan[ch][pixel_row] = occ
 local live_visible = true
 local live_room = nil
+local live_tick_obs = nil   -- time-pos 观察器句柄（仅直播模式注册）
 
 local function get_live_room()
 	if o.live_enable ~= "yes" then return nil end
@@ -262,11 +272,23 @@ local function Live_render()
 	local alpha = live_alpha_tag()
 	local outline = math.max(fs / 25, 1) -- 同 WriteASSHead 的 outline
 	local now_ms = math.floor(mp.get_time() * 1000 + 0.5)
-	-- 过期清理：显示期一过就剔除，不囤积
+	local live_max_items = tonumber(o.live_max) or 60
+	if live_max_items < 1 then live_max_items = 1 end
+	-- 过期清理 + 拼接本帧所有应显示的弹幕
 	local fresh, parts = {}, {}
 	for _, it in ipairs(live_items) do
 		if now_ms < it.end_ms then
 			fresh[#fresh + 1] = it
+			live_emit(parts, it, dw, now_ms, font_tag, alpha, outline)
+		end
+	end
+	-- 同屏上限：只保留最新的 N 条（旧弹幕已显示过，丢的是寿命尾段）。
+	-- 必须在此裁剪，否则超高密度房间里每帧拼串量会失控。
+	if #fresh > live_max_items then
+		local drop = #fresh - live_max_items
+		for i = 1, drop do table.remove(fresh, 1) end
+		parts = {}
+		for _, it in ipairs(fresh) do
 			live_emit(parts, it, dw, now_ms, font_tag, alpha, outline)
 		end
 	end
@@ -275,6 +297,14 @@ local function Live_render()
 	live_overlay.res_x = dw
 	live_overlay.res_y = dh
 	live_overlay:update()
+end
+
+-- 由视频帧驱动：time-pos 每次变化（即每显示一帧）都重绘一次。
+-- 没有在屏弹幕时直接跳过，空闲不花任何 CPU。
+local function live_on_tick(_, value)
+	if not live_overlay or not live_visible then return end
+	if value == nil or #live_items == 0 then return end
+	Live_render()
 end
 
 local function Live_poll()
@@ -358,7 +388,9 @@ local function Live_poll()
 		end
 	end
 	for line in complete:gmatch("[^\r\n]+") do keep_line(line) end
-	Live_render()
+	-- 只负责“收”，画面推进交给 time-pos 逐帧重绘（live_on_tick）。
+	-- 这里补一次渲染，保证视频暂停/未出帧时新弹幕也能出现。
+	if #live_items > 0 then Live_render() end
 end
 
 -- 启动直播弹幕：起 live_danmu.py 子进程 + 定时 tail
@@ -389,12 +421,21 @@ local function Live_start(room)
 		end
 	end)
 	live_timer = mp.add_periodic_timer(
-		tonumber(o.live_interval) or 0.05, Live_poll)
+		tonumber(o.live_ingest) or 0.2, Live_poll)
+	-- time-pos 观察器：由视频帧驱动重绘（见文件顶部说明）。
+	-- native 属性，time-pos 每帧都变，等价于“每显示一帧回调一次”。
+	if not live_tick_obs then
+		live_tick_obs = mp.observe_property("time-pos", "native", live_on_tick)
+	end
 	log("直播间 " .. room .. " 实时弹幕已启动，按 b 切换显示")
 end
 
 function Live_stop()
 	if live_timer then live_timer:kill() live_timer = nil end
+	if live_tick_obs then
+		pcall(mp.unobserve_property, live_tick_obs)
+		live_tick_obs = nil
+	end
 	if live_cmd then
 		pcall(mp.abort_async_command, live_cmd)
 		live_cmd = nil

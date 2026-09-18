@@ -20,6 +20,7 @@ local props = {
 }
 local FAKE_TIME = 1000.0
 local overlay_data, timers, events, spawned, overlay_res = nil, {}, {}, nil, {}
+local obs = {}
 
 package.preload["mp.options"] = function()
   return { read_options = function() end }
@@ -68,7 +69,11 @@ package.preload["mp"] = function()
     add_key_binding = function() end,
     register_event = function(n, fn) events[n] = fn end,
     register_script_message = function() end,
-    observe_property = function() end,
+    observe_property = function(name, kind, fn)
+      obs[name] = fn
+      return 1
+    end,
+    unobserve_property = function() end,
     msg = {info = function() end, warn = function() end, error = function() end},
     osd_message = function() end,
   }
@@ -78,11 +83,13 @@ dofile(MAIN)
 events["file-loaded"]()
 assert(spawned, "未进入直播分支")
 
--- 反复 tick，累积消费真实 jsonl；渲染峰值必须 > 0
+-- 反复 tick：收取靠 ingest timer，画面推进靠 time-pos 逐帧回调（60fps）
+assert(obs["time-pos"], "未注册 time-pos 观察器")
 local peak = 0
-for _ = 1, 40 do
-  FAKE_TIME = FAKE_TIME + 0.25
-  timers[1].fn()
+for _ = 1, 120 do
+  FAKE_TIME = FAKE_TIME + 1 / 60
+  timers[1].fn()                                   -- 收弹幕
+  obs["time-pos"]("time-pos", FAKE_TIME)           -- 逐帧重绘
   if overlay_data then
     local n = select(2, overlay_data:gsub("\\pos", ""))
     if n > peak then peak = n end

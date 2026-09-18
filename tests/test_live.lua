@@ -16,6 +16,8 @@ local props = {
   ["width"] = 1920, ["height"] = 1080,
   -- 与 script-opts.conf 里的实际取值保持一致
   ["opt:live_trim"] = "yes",
+  ["opt:live_ingest"] = "0.2",
+  ["opt:live_max"] = "60",
   ["opt:fontsize"] = "50",
   ["opt:percent"] = "0.85",
   ["opt:duration_marquee"] = "10",
@@ -25,6 +27,7 @@ local props = {
 }
 local overlay_data, overlay_res = nil, {}
 local timers, events, spawned = {}, {}, nil
+local obs = {}
 local key_bindings = {}
 local FAKE_FILES = {}
 
@@ -82,7 +85,11 @@ package.preload["mp"] = function()
     add_key_binding = function(k, n, fn) key_bindings[k or n] = fn end,
     register_event = function(n, fn) events[n] = fn end,
     register_script_message = function() end,
-    observe_property = function() end,
+    observe_property = function(name, kind, fn)
+      obs[name] = fn
+      return 1
+    end,
+    unobserve_property = function(id) obs["__unobs"] = (obs["__unobs"] or 0) + 1 end,
     msg = {info = function() end, warn = function() end, error = function() end},
     osd_message = function() end,
   }
@@ -148,7 +155,7 @@ events["file-loaded"]()
 assert(spawned and spawned.args, "未启动 live_danmu.py 子进程")
 print("子进程: " .. table.concat(spawned.args, " "))
 local timer = timers[1]
-assert(timer and math.abs(timer.iv - 0.05) < 1e-9, "轮询间隔不是 0.05s")
+assert(timer and math.abs(timer.iv - 0.2) < 1e-9, "收取间隔不是 0.2s")
 
 -- ============ 1. 行排布必须与 Danmu2Ass 逐字对拍 ============
 -- 用真 Danmu2Ass(-s 1920x1080 -fs 50 -p 918 -dm 10 -ds 5) 跑同样 4 条（t=0,1,2,3）
@@ -193,18 +200,21 @@ assert(overlay_data:find("\\fs50", 1, true), "字号不对（应为 fontsize=50�
 assert(overlay_data:find("\\q2", 1, true), "缺少 \\q2（换行策略）")
 print("OK: 字体/字号/样式显式声明")
 
--- ============ 4. 平滑推进：x 随 0.05s 步进单调左移，且每步位移恒定 ============
+-- ============ 4. 逐帧重绘：由 time-pos 驱动，位移随帧严格均匀 ============
+-- overlay 必须注册 time-pos 观察器（这正是不卡顿的关键：视频帧驱动）
+assert(obs["time-pos"], "未注册 time-pos 观察器，无法逐帧重绘")
 local function first_x()
-  local s = overlay_data:match("\\pos%((%-?%d+),")
-  return tonumber(s)
+  local v = overlay_data:match("\\pos%((%-?%d+),")
+  return tonumber(v)
 end
+-- 模拟 60fps 连续出帧：只靠观察器推进（不再经过 ingest timer）
 local xs = {}
-for i = 1, 5 do
-  FAKE_TIME = FAKE_TIME + 0.05
-  timer.fn()
+for i = 1, 6 do
+  FAKE_TIME = FAKE_TIME + 1 / 60
+  obs["time-pos"]("time-pos", 1.0 + i / 60)
   xs[#xs + 1] = first_x()
 end
-print("x 序列: " .. table.concat(xs, ","))
+print("x 序列(60fps): " .. table.concat(xs, ","))
 local d0 = xs[2] - xs[1]
 for i = 2, #xs - 1 do
   local d = xs[i + 1] - xs[i]
@@ -212,7 +222,7 @@ for i = 2, #xs - 1 do
     "位移不均匀（卡顿）: " .. table.concat(xs, ","))
 end
 assert(xs[#xs] < xs[1], "弹幕未左移")
-print("OK: 匀速推进（\pos 0.05s 步进，位移恒定）")
+print("OK: time-pos 逐帧驱动推进（60fps 位移恒定）")
 
 -- ============ 5. 不提前消失：显示期未到就不该消失 ============
 -- marquee=10s，刚过 0.25s，本 tick 出现的弹幕必须仍在
