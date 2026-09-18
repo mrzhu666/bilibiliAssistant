@@ -48,6 +48,13 @@ local o = {
 	live_room = "",
 	--直播弹幕读完后是否截断 jsonl（yes=已播弹幕直接删除，不囤积）
 	live_trim = "yes",
+	--弹幕前缀处理：截断到第一个冒号，即去掉"用户名："前缀。
+	--no=完全不处理（保留完整"用户名：内容"）
+	--trim=截断到第一个冒号（默认）
+	--trim_keep=截断但保留用户名（显示为"用户名 内容"）
+	live_prefix = "trim",
+	--前缀截断后又空了的弹幕是否丢弃（yes=丢弃该条 / no=保留原文）
+	live_prefix_drop_empty = "yes",
 }
 
 options.read_options(o)
@@ -187,6 +194,50 @@ local function live_layout()
 	local bottom_reserved = math.floor(pct * dh)
 	local area_bottom = dh - bottom_reserved -- 弹幕可用区域下边界（像素）
 	return dw, dh, fs, bottom_reserved, area_bottom
+end
+
+-- 弹幕文本预处理：默认截断到第一个冒号，即去掉 "用户名：" 这类前缀。
+-- live_prefix 取值：
+--   no         完全不处理（保留完整"用户名：内容"）
+--   trim       截断到第一个冒号（默认）
+--   trim_keep  截断但保留用户名，显示为"用户名 内容"
+-- 返回处理后的文本；若截断后为空则按 live_prefix_drop_empty 决定丢弃或保留原文。
+-- 注意：不能用 [：:] 字符类——Lua 的字符类是逐字节的，全角「：」占 3 字节，
+-- 会被拆成三个单字节分别匹配，从而从字符中间切断。必须用 plain 查找。
+-- 半角 ":" 与全角 "：" 都算；URL 协议头（http://）的冒号不当分隔符。
+local function live_preprocess(text, user)
+	local mode = tostring(o.live_prefix or "trim")
+	if mode == "no" then return user .. "：" .. text end
+	local label = user .. "：" .. text
+	local hs = label:find(":", 1, true)  -- 半角
+	local fs = label:find("：", 1, true) -- 全角（plain：按整串精确匹配）
+	local pos, clen
+	if hs and fs then
+		if hs < fs then pos, clen = hs, 1 else pos, clen = fs, #"：" end
+	elseif hs then
+		pos, clen = hs, 1
+	elseif fs then
+		pos, clen = fs, #"："
+	else
+		return label -- 没有冒号，原样
+	end
+	local head = label:sub(1, pos - 1)
+	local after = label:sub(pos + clen)
+	-- 形如 http:// / https:// 的协议头，保留原样
+	if head:match("^%a[%w+.-]*$") and after:sub(1, 2) == "//" then
+		return label
+	end
+	local rest = after:gsub("^%s+", "")
+	if rest == "" then
+		if tostring(o.live_prefix_drop_empty) == "no" then
+			return head -- 保留原文（至少还有用户名）
+		end
+		return nil -- 丢弃该条
+	end
+	if mode == "trim_keep" then
+		return head .. " " .. rest
+	end
+	return rest
 end
 
 -- 通道占用项：{T=出生毫秒, len=像素长度, fixed=是否固定, dur=自身显示时长}
@@ -360,12 +411,14 @@ local function Live_poll()
 	local function keep_line(line)
 		local ok, d = pcall(utils.parse_json, line)
 		if not (ok and d and d.text) then return end
-		local label = d.user .. "：" .. d.text
+		-- 预处理：默认截断到第一个冒号，去掉"用户名："前缀
+		local label = live_preprocess(d.text, d.user)
+		if not label then return end
 		local dur_ms = marquee_ms
 		if d.type == "sc" then
-			label = string.format("[SC ¥%s]%s：%s",
-				tostring(d.price or "?"), d.user, d.text)
-			dur_ms = still_ms * 2 -- SC 借用静止时长翻倍，醒目
+			-- SC 借用静止时长翻倍，醒目
+			label = string.format("[SC ¥%s]%s", tostring(d.price or "?"), label)
+			dur_ms = still_ms * 2
 		end
 		local ch = MODE2CH[tonumber(d.mode) or 1] or 0
 		local ssize = tonumber(d.size) or 25

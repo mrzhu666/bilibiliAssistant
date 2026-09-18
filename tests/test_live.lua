@@ -28,13 +28,14 @@ local props = {
 }
 local overlay_data, overlay_res = nil, {}
 local timers, events, spawned = {}, {}, nil
-local obs = {}
+local obs, OPT = {}, nil
 local key_bindings = {}
 local commands = {}
 local FAKE_FILES = {}
 
 package.preload["mp.options"] = function()
-  return { read_options = function() end }
+  -- 抓住脚本配置表引用，便于测试里像 mpv 运行时那样改选项
+  return { read_options = function(t) OPT = t end }
 end
 package.preload["mp.utils"] = function()
   return {
@@ -307,6 +308,46 @@ end
 assert(commands.vf_remove and commands.vf_remove > 0,
   "高帧率时未撤掉提帧滤镜")
 print("OK: 直播同样复用 fps_vf 提帧")
+
+-- ============ 10b. 预处理：截断到第一个冒号，去掉"用户名：" ============
+-- 回归点：全角「：」是 3 字节，若用 [：:] 字符类会被逐字节拆开、从字中间切断
+FAKE_FILES.jsonl = dm("小明", "你好啊", 16777215, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(overlay_data:find("你好啊", 1, true), "未保留冒号后的内容")
+assert(not overlay_data:find("小明", 1, true), "用户名前缀未被截掉")
+assert(not overlay_data:find("：你好", 1, true), "全角冒号未被正确识别")
+-- 含多个冒号：只截第一个
+FAKE_FILES.jsonl = dm("张三", "含 123：多个冒号", 16777215, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(overlay_data:find("含 123：多个冒号", 1, true), "多个冒号时截错了")
+-- URL 的协议头不应被当成分隔符
+FAKE_FILES.jsonl = dm("李四", "看 http://a.com", 16777215, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(overlay_data:find("http://a.com", 1, true), "URL 协议头被截坏")
+-- 冒号后为空 -> 丢弃该条
+FAKE_FILES.jsonl = dm("王五", "", 16777215, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(not overlay_data:find("王五", 1, true), "空内容弹幕未被丢弃")
+print("OK: 前缀截断（多字节安全 / URL 保护 / 空内容丢弃）")
+
+-- live_prefix=no 时应保留完整"用户名：内容"
+OPT.live_prefix = "no"
+FAKE_FILES.jsonl = dm("赵六", "完整保留", 16777215, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(overlay_data:find("赵六：完整保留", 1, true), "live_prefix=no 未保留前缀")
+-- live_prefix=trim_keep 时应为"用户名 内容"
+OPT.live_prefix = "trim_keep"
+FAKE_FILES.jsonl = dm("钱七", "保留名字", 16777215, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(overlay_data:find("钱七 保留名字", 1, true), "live_prefix=trim_keep 不对")
+OPT.live_prefix = "trim"
+print("OK: live_prefix 三种模式")
 
 -- ============ 10. jsonl 截断 + 结束清理 ============
 assert(FAKE_FILES.jsonl == "" or FAKE_FILES.jsonl == nil, "live_trim 未截断")
