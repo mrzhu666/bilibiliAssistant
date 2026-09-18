@@ -31,8 +31,14 @@ local o = {
 	use_python = true,
 	-- python可执行文件路径，默认为环境变量的python，若无法运行请指定 python[.exe] 的路径
 	python_path = "python",
-	--直播弹幕读取 jsonl 的间隔（秒）。只负责“收弹幕”，与流畅度无关：
-	--画面推进走 time-pos 逐帧重绘，见 live_on_tick
+	--直播弹幕【重绘】间隔（秒）。决定顺滑度，与收取无关。
+	--为什么不用 observe_property("time-pos")：mpv 的属性变更事件是 coalesced 的
+	--（见手册 "Property changes are coalesced"），实测会隔帧丢事件（mpv#4195
+	-- 有日志：every second frame / 3-5 帧的空洞），重绘反而不规律。
+	--定时器由事件循环按截止时间触发，播放时循环被视频帧唤醒，10ms 约等于
+	--"每帧一次"，这也是 uosc_danmaku 等实现采用的方式。
+	live_interval = "0.01",
+	--直播弹幕【收取】间隔（秒），只负责读 jsonl，与流畅度无关
 	live_ingest = "0.2",
 	--直播同屏弹幕上限（防超高密度房间让每帧拼串开销失控）
 	live_max = "60",
@@ -53,6 +59,8 @@ local sec_sub_ass_override = mp.get_property_native("secondary-sub-ass-override"
 
 -- 前向声明：log 在下方才定义，直播分支也要用
 local log
+-- 前向声明：提帧函数定义在下方（点播部分），直播分支也要复用
+local Add_fps_vf
 
 -- ============ B站直播实时弹幕 ============
 -- 显示规则严格对齐点播 Danmu2Ass，保证与点播弹幕长得一样、动得一样：
@@ -73,13 +81,14 @@ local log
 local live_cmd = nil      -- subprocess 句柄（可 abort）
 local live_file = nil     -- jsonl 路径
 local live_overlay = nil  -- osd overlay
-local live_timer = nil    -- 读取 jsonl 的定时器（与流畅度无关）
+local live_timer = nil    -- 收取 jsonl 的定时器（与流畅度无关）
+local live_rtimer = nil   -- 重绘定时器（决定顺滑度）
 local live_offset = 0     -- jsonl 已读字节数
 local live_items = {}     -- 在屏弹幕
 local live_chan = {}      -- 通道占用表：live_chan[ch][pixel_row] = occ
 local live_visible = true
 local live_room = nil
-local live_tick_obs = nil   -- time-pos 观察器句柄（仅直播模式注册）
+local live_danmu_open = false -- 直播弹幕是否处于开启状态（供 Add_fps_vf 判断）
 
 local function get_live_room()
 	if o.live_enable ~= "yes" then return nil end
@@ -299,11 +308,18 @@ local function Live_render()
 	live_overlay:update()
 end
 
--- 由视频帧驱动：time-pos 每次变化（即每显示一帧）都重绘一次。
--- 没有在屏弹幕时直接跳过，空闲不花任何 CPU。
-local function live_on_tick(_, value)
+-- 重绘定时器回调：高频（默认 10ms）推进坐标。
+-- 没有在屏弹幕时直接跳过，空闲不花任何 CPU 也不刷屏。
+local live_fps_tick = 0
+local function live_render_tick()
 	if not live_overlay or not live_visible then return end
-	if value == nil or #live_items == 0 then return end
+	if #live_items == 0 then return end
+	-- 顺带低频重估提帧（直播流帧率可能中途变化；10ms 一次评估太浪费）
+	live_fps_tick = live_fps_tick + 1
+	if live_fps_tick >= 100 then
+		live_fps_tick = 0
+		Add_fps_vf()
+	end
 	Live_render()
 end
 
@@ -388,8 +404,7 @@ local function Live_poll()
 		end
 	end
 	for line in complete:gmatch("[^\r\n]+") do keep_line(line) end
-	-- 只负责“收”，画面推进交给 time-pos 逐帧重绘（live_on_tick）。
-	-- 这里补一次渲染，保证视频暂停/未出帧时新弹幕也能出现。
+	-- 这里补一次渲染，保证视频暂停时新弹幕也能立刻出现（重绘定时器照跑）
 	if #live_items > 0 then Live_render() end
 end
 
@@ -422,20 +437,19 @@ local function Live_start(room)
 	end)
 	live_timer = mp.add_periodic_timer(
 		tonumber(o.live_ingest) or 0.2, Live_poll)
-	-- time-pos 观察器：由视频帧驱动重绘（见文件顶部说明）。
-	-- native 属性，time-pos 每帧都变，等价于“每显示一帧回调一次”。
-	if not live_tick_obs then
-		live_tick_obs = mp.observe_property("time-pos", "native", live_on_tick)
-	end
+	-- 重绘定时器：顺滑度就靠它（10ms 约等于每帧一次）
+	live_rtimer = mp.add_periodic_timer(
+		tonumber(o.live_interval) or 0.01, live_render_tick)
+	-- 提帧：直播流常见 30fps，画面本身只有 30Hz，“弹幕再顺”也会被画面拖住。
+	-- 复用点播那套 fps_vf（<45fps 自动 fps=60），这是插件本来就有的一致性做法。
+	live_danmu_open = true
+	Add_fps_vf()
 	log("直播间 " .. room .. " 实时弹幕已启动，按 b 切换显示")
 end
 
 function Live_stop()
 	if live_timer then live_timer:kill() live_timer = nil end
-	if live_tick_obs then
-		pcall(mp.unobserve_property, live_tick_obs)
-		live_tick_obs = nil
-	end
+	if live_rtimer then live_rtimer:kill() live_rtimer = nil end
 	if live_cmd then
 		pcall(mp.abort_async_command, live_cmd)
 		live_cmd = nil
@@ -448,11 +462,16 @@ function Live_stop()
 	live_items, live_chan = {}, {}
 	live_offset, live_file, live_room = 0, nil, nil
 	live_visible = true
+	live_danmu_open = false
+	Add_fps_vf() -- 直播结束，撤掉可能加上的提帧滤镜
 end
 
 local function Live_toggle()
 	if not live_overlay then return false end
 	live_visible = not live_visible
+	-- 隐藏时不必白刷 overlay，也让提帧滤镜能跟着撤掉
+	live_danmu_open = live_visible
+	if live_visible then Add_fps_vf() end
 	log(live_visible and "显示直播弹幕" or "隐藏直播弹幕")
 	Live_render()
 	return true
@@ -661,13 +680,19 @@ function Danmaku_show()
 	Add_fps_vf()
 end
 
-function Add_fps_vf()
-	if not danmu_open or not o.fps_vf then return end
+Add_fps_vf = function()
+	-- 点播与直播任一在显示，都需要提帧保证弹幕顺滑
+	if not (danmu_open or live_danmu_open) or not o.fps_vf then return end
 
-	local video_fps = mp.get_property_number("container-fps", 30)
+	-- 直播流有时拿不到 container-fps，用 estimated-vf-fps 兜底
+	local video_fps = mp.get_property_number("container-fps", 0) or 0
+	if video_fps <= 0 then
+		video_fps = mp.get_property_number("estimated-vf-fps", 0) or 0
+	end
 	local video_speed = mp.get_property_number("speed", 1)
 
-	if video_fps < 45 and video_speed < 1.5 then
+	-- 拿不到帧率时不加滤镜（宁可不加，也不要误判成低帧率）
+	if video_fps > 0 and video_fps < 45 and video_speed < 1.5 then
 		mp.commandv('vf', 'append', '@Danmaku-FPS:lavfi="fps=fps=60:round=down"')
 	else
 		mp.commandv('vf', 'remove', '@Danmaku-FPS')

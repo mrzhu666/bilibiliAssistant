@@ -17,6 +17,7 @@ local props = {
   -- 与 script-opts.conf 里的实际取值保持一致
   ["opt:live_trim"] = "yes",
   ["opt:live_ingest"] = "0.2",
+  ["opt:live_interval"] = "0.01",
   ["opt:live_max"] = "60",
   ["opt:fontsize"] = "50",
   ["opt:percent"] = "0.85",
@@ -29,6 +30,7 @@ local overlay_data, overlay_res = nil, {}
 local timers, events, spawned = {}, {}, nil
 local obs = {}
 local key_bindings = {}
+local commands = {}
 local FAKE_FILES = {}
 
 package.preload["mp.options"] = function()
@@ -62,7 +64,15 @@ package.preload["mp"] = function()
     set_property_native = function(k, v) props[k] = v end,
     get_opt = function(k) return props["opt:" .. k] end,
     get_script_directory = function() return script_dir end,
-    commandv = function() end,
+    commandv = function(...)
+      local a = {...}
+      if a[1] == "vf" then
+        if a[2] == "append" then commands.vf_append = a[3]
+        elseif a[2] == "remove" then
+          commands.vf_remove = (commands.vf_remove or 0) + 1
+        end
+      end
+    end,
     command = function() end,
     command_native = function() return {} end,
     command_native_async = function(t) spawned = t; return {pid = 1} end,
@@ -200,18 +210,22 @@ assert(overlay_data:find("\\fs50", 1, true), "字号不对（应为 fontsize=50�
 assert(overlay_data:find("\\q2", 1, true), "缺少 \\q2（换行策略）")
 print("OK: 字体/字号/样式显式声明")
 
--- ============ 4. 逐帧重绘：由 time-pos 驱动，位移随帧严格均匀 ============
--- overlay 必须注册 time-pos 观察器（这正是不卡顿的关键：视频帧驱动）
-assert(obs["time-pos"], "未注册 time-pos 观察器，无法逐帧重绘")
+-- ============ 4. 重绘定时器：高频推进，位移严格均匀 ============
+-- 关键：必须用高频定时器而不是 observe_property("time-pos")。
+-- mpv 的属性事件是 coalesced 的，实测会隔帧丢（mpv#4195），重绘会不规律。
+assert(timers[2], "缺少重绘定时器")
+local rtimer = timers[2]
+assert(math.abs(rtimer.iv - 0.01) < 1e-9, "重绘间隔不是 0.01s")
+assert(not obs["time-pos"], "不应依赖 time-pos 观察器（属性事件会被合并丢帧）")
 local function first_x()
   local v = overlay_data:match("\\pos%((%-?%d+),")
   return tonumber(v)
 end
--- 模拟 60fps 连续出帧：只靠观察器推进（不再经过 ingest timer）
+-- 模拟 60fps 播放：定时器每 1/60s 触发一次
 local xs = {}
 for i = 1, 6 do
   FAKE_TIME = FAKE_TIME + 1 / 60
-  obs["time-pos"]("time-pos", 1.0 + i / 60)
+  rtimer.fn()
   xs[#xs + 1] = first_x()
 end
 print("x 序列(60fps): " .. table.concat(xs, ","))
@@ -222,7 +236,7 @@ for i = 2, #xs - 1 do
     "位移不均匀（卡顿）: " .. table.concat(xs, ","))
 end
 assert(xs[#xs] < xs[1], "弹幕未左移")
-print("OK: time-pos 逐帧驱动推进（60fps 位移恒定）")
+print("OK: 高频重绘定时器推进（60fps 位移恒定）")
 
 -- ============ 5. 不提前消失：显示期未到就不该消失 ============
 -- marquee=10s，刚过 0.25s，本 tick 出现的弹幕必须仍在
@@ -271,6 +285,28 @@ FAKE_TIME = FAKE_TIME + 60
 timer.fn()
 assert(overlay_data:find("\\{", 1, true), "花括号未转义")
 print("OK: ASS 转义生效")
+
+-- ============ 9b. 提帧：直播也复用 fps_vf（<45fps 自动 fps=60） ============
+-- 直播流常见 30fps，画面本身只有 30Hz，不提帧弹幕再顺也会被拖住
+FAKE_FILES.jsonl = dm("f", "FPS", 16777215, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+props["container-fps"] = 30
+timer.fn()          -- 收到弹幕
+-- 提帧评估挂在重绘 tick 上（低频重估），推进足够多次让它触发
+for i = 1, 120 do
+  FAKE_TIME = FAKE_TIME + 0.01
+  rtimer.fn()
+end
+assert(commands.vf_append and commands.vf_append:find("fps=fps=60", 1, true),
+  "低帧率直播未自动提帧到 60fps")
+props["container-fps"] = 60
+for i = 1, 120 do
+  FAKE_TIME = FAKE_TIME + 0.01
+  rtimer.fn()
+end
+assert(commands.vf_remove and commands.vf_remove > 0,
+  "高帧率时未撤掉提帧滤镜")
+print("OK: 直播同样复用 fps_vf 提帧")
 
 -- ============ 10. jsonl 截断 + 结束清理 ============
 assert(FAKE_FILES.jsonl == "" or FAKE_FILES.jsonl == nil, "live_trim 未截断")

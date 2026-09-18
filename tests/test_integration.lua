@@ -83,13 +83,13 @@ dofile(MAIN)
 events["file-loaded"]()
 assert(spawned, "未进入直播分支")
 
--- 反复 tick：收取靠 ingest timer，画面推进靠 time-pos 逐帧回调（60fps）
-assert(obs["time-pos"], "未注册 time-pos 观察器")
+-- 反复 tick：timers[1]=收取(0.2s)，timers[2]=重绘(0.01s)
+assert(timers[1] and timers[2], "缺少收取/重绘定时器")
 local peak = 0
-for _ = 1, 120 do
+for _ = 1, 600 do
   FAKE_TIME = FAKE_TIME + 1 / 60
-  timers[1].fn()                                   -- 收弹幕
-  obs["time-pos"]("time-pos", FAKE_TIME)           -- 逐帧重绘
+  timers[1].fn()   -- 收弹幕
+  timers[2].fn()   -- 高频重绘（顺滑度来源）
   if overlay_data then
     local n = select(2, overlay_data:gsub("\\pos", ""))
     if n > peak then peak = n end
