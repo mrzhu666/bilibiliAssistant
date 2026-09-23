@@ -63,7 +63,7 @@ local o = {
 	live_color_dim = "0.75",
 }
 
-options.read_options(o)
+options.read_options(o, "bilibiliAssistant")
 
 local danmu_file = nil
 local danmu_open = false

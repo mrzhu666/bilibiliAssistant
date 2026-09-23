@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""B站直播弹幕抓取器（mpv bilibiliAssert 插件的直播后端）.
+"""B站直播弹幕抓取器（mpv bilibiliAssistant 插件的直播后端）.
 
 只用 Python 标准库（socket/ssl/struct/json/zlib/urllib/logging），
 mpv-lazy 自带 Python 无需装任何第三方包即可运行。
