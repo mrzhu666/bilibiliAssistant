@@ -155,6 +155,7 @@ mpv --script-opts-append="cid=<cid>" <视频文件>
 
 - 广告跳过
 - 高能进度条
+- SC 滞留显示
 
 ## 相关项目
 
