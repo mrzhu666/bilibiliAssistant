@@ -652,12 +652,16 @@ local function Danmaku_check()
 
 	if cid == nil then
 		local path = mp.get_property("path")
-		if path and not path:find('^%a[%w.+-]-://') and not (path:find('bilibili.com') or path:find('bilivideo.com')) then
-			return
-		end
-
 		local danmaku_id = nil
 		cid, danmaku_id = get_cid()
+
+		if cid == nil then
+			-- 没有弹幕轨道 → 不是 B 站（或这条片没抓到弹幕）：直接返回，绝不能碰 sid。
+			-- 原实现不看来源就执行下面的 sid=false，会把「非 B 站 URL（如其它站点 m3u8）」的
+			-- 正片外挂字幕一并关掉；若改用 URL 里有没有 bilibili.com 来判别，又会漏掉 B 站走
+			-- akamaized 等第三方 CDN 的情况。以「有没有弹幕轨道」为准，与 CDN 域名无关。
+			return
+		end
 
 		if danmaku_id ~= nil then
 			mp.commandv('sub-remove', danmaku_id)
