@@ -17,6 +17,8 @@ mpv-lazy 自带 Python 无需装任何第三方包即可运行。
    "size": 25, "type": "danmu"}
   {"user": "昵称", "text": "SC留言", "color": 16777215, "mode": 1,
    "size": 25, "type": "sc", "price": 30}
+  注：SC 的 mode 固定为 1（B站不提供 SC 的位置语义），实际显示方式由
+  lua 侧 live_sc_mode 决定：默认 top = 顶部固定弹幕（同 B站网页）。
 
 用法：
   python live_danmu.py <room_id> <out.jsonl>

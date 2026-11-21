@@ -70,6 +70,12 @@ local o = {
 	--彩色弹幕调暗系数(0.3-1.0，1=不调)。黄/蓝等饱和色发亮刺眼时调低即可。
 	--只作用于彩色弹幕，默认白字(FFFFFF)与黑字不受影响。
 	live_color_dim = "0.75",
+	--SC（醒目留言）显示方式：top(默认，顶部固定弹幕) / scroll(旧行为，滚动)
+	--B站网页播放器把 SC 钉在顶部固定位置停留，而不是让它飘过去；
+	--固定显示也便于读完整条内容（SC 往往很长，滚动会来不及看）。
+	live_sc_mode = "top",
+	--SC 停留秒数（仅 live_sc_mode=top 生效）。0 或留空 = 用 duration_still * 2。
+	live_sc_dur = "",
 	--直播自动重连：掉线 / 卡顿自愈。详见下方「直播自动重连」小节
 	live_reconnect = "yes",
 	--判定“卡顿”的阈值：paused-for-cache 持续多少秒就重载换线路
@@ -604,12 +610,22 @@ local function Live_poll()
 		local w = utf8_len(label) * fsize -- 等价 CalculateLength(c) * size
 		local dur_ms = marquee_ms
 		local row_speed = speed
-		if d.type == "sc" then
-			-- SC 借用静止时长翻倍，醒目；SC 不参与固定速度（它有自己的节奏），
-			-- 因此排位判定也按固定秒数走，保持两条式子自洽。
+		local is_sc = (d.type == "sc")
+		if is_sc then
 			label = string.format("[SC ¥%s]%s", tostring(d.price or "?"), label)
-			dur_ms = still_ms * 2
-			row_speed = 0
+			-- 文字变了要重算宽度，否则排位判定会按旧长度算
+			w = utf8_len(label) * fsize
+			if tostring(o.live_sc_mode or "top") == "top" then
+				-- SC 默认走顶部固定弹幕（对齐 B站网页播放器：钉住停留，不飘过去）。
+				-- 固定通道用 ch=1（顶部），dur 用 SC 自己的停留时长。
+				ch = 1
+				dur_ms = tonumber(o.live_sc_dur) or 0
+				if dur_ms <= 0 then dur_ms = still_ms * 2 else dur_ms = dur_ms * 1000 end
+			else
+				-- live_sc_mode=scroll：保留旧的滚动行为（时长仍翻倍，醒目）
+				dur_ms = still_ms * 2
+			end
+			row_speed = 0 -- SC 不参与固定速度
 		elseif speed > 0 and not (ch == 1 or ch == 2) then
 			dur_ms = math.floor((W + w) / (speed * W) * 1000 + 0.5)
 		end

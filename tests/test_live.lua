@@ -154,6 +154,10 @@ local function dm(user, text, color, mode, size)
   return ('{"user":"%s","text":"%s","color":%d,"mode":%d,"size":%d,' ..
     '"type":"danmu"}'):format(user, text, color, mode or 1, size or 25)
 end
+local function scdm(user, text, color, price, mode, size)
+  return ('{"user":"%s","text":"%s","color":%d,"mode":%d,"size":%d,' ..
+    '"type":"sc","price":%d}'):format(user, text, color, mode or 1, size or 25, price or 30)
+end
 local function scan(pat)
   local out = {}
   for v in overlay_data:gmatch(pat) do out[#out + 1] = tonumber(v) end
@@ -376,6 +380,43 @@ timer.fn()
 assert(overlay_data:find("\\an8", 1, true), "顶部固定弹幕缺少 an8")
 assert(overlay_data:find("\\an2", 1, true), "底部固定弹幕缺少 an2")
 print("OK: 固定弹幕 an8/an2 正确")
+
+-- ============ 8b. SC 默认走顶部固定弹幕（不再滚动） ============
+-- B站网页播放器把 SC 钉在顶部固定位置，不飘过去；SC 往往很长，滚动也来不及看。
+assert((OPT.live_sc_mode or "top") == "top", "SC 默认应为 top（顶部固定）")
+FAKE_FILES.jsonl = scdm("scuser", "这是一条SC留言", 16711680, 30) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+-- SC 必须是固定弹幕：an8（顶部）+ \pos，且不带 \move
+local sc_line
+for line in overlay_data:gmatch("[^\n]+") do
+  if line:find("这是一条SC留言", 1, true) then sc_line = line break end
+end
+assert(sc_line, "SC 未渲染")
+assert(sc_line:find("\\an8", 1, true), "SC 应为顶部固定弹幕（an8）: " .. sc_line)
+assert(not sc_line:find("\\an7", 1, true), "SC 不应再用滚动定位（an7）: " .. sc_line)
+assert(sc_line:find("[SC ¥30]", 1, true), "SC 未显示金额前缀: " .. sc_line)
+-- 停留时长：默认 duration_still * 2
+FAKE_TIME = FAKE_TIME + 6   -- 6s > duration_still(5)，但 < 10
+rtimer.fn()
+assert(overlay_data:find("这是一条SC留言", 1, true), "SC 停留时间不足（应约 10s）")
+FAKE_TIME = FAKE_TIME + 5   -- 累计 11s > 10
+rtimer.fn()
+assert(not overlay_data:find("这是一条SC留言", 1, true), "SC 超时后未消失")
+print("OK: SC 默认顶部固定弹幕（an8 + 金额前缀 + 停留约 10s）")
+
+-- live_sc_mode=scroll 时退回旧的滚动行为
+OPT.live_sc_mode = "scroll"
+FAKE_FILES.jsonl = scdm("scuser2", "滚动SC", 16711680, 50) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+local sc2
+for line in overlay_data:gmatch("[^\n]+") do
+  if line:find("滚动SC", 1, true) then sc2 = line break end
+end
+assert(sc2 and sc2:find("\\an7", 1, true), "live_sc_mode=scroll 时应走滚动: " .. tostring(sc2))
+OPT.live_sc_mode = "top"
+print("OK: live_sc_mode=scroll 可退回旧行为")
 
 -- ============ 9. 转义：花括号不可注入 ============
 FAKE_FILES.jsonl = dm("x", "\\{bad\\}", 16777215, 1, 25) .. "\n"
