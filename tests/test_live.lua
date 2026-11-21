@@ -374,6 +374,76 @@ assert(commands.vf_remove and commands.vf_remove > 0,
   "高帧率时未撤掉提帧滤镜")
 print("OK: 直播同样复用 fps_vf 提帧")
 
+-- ============ 9c. 速度参数：所有滚动弹幕速度相同，与文字长度无关 ============
+-- 用户要求把「固定秒数」换成「固定速度」：duration_marquee 只决定"穿过一屏"的
+-- 基准时间，长弹幕不再因为固定秒数而被逼着跑得更快（也就不会追尾挤压）。
+-- 这里用 0.2 屏宽/秒：1920 宽舞台上应为 384 U/s，与文字长度无关。
+local function pos_xs()
+  local out = {}
+  for v in overlay_data:gmatch("\\pos%((%-?%d+),") do out[#out + 1] = tonumber(v) end
+  return out
+end
+local function measure_speed_u(text)
+  FAKE_FILES.jsonl = dm("s", text, 16777215, 1, 25) .. "\n"
+  FAKE_TIME = FAKE_TIME + 60      -- 清掉上一批，只留本条
+  timer.fn()
+  local x0 = pos_xs()[1]
+  FAKE_TIME = FAKE_TIME + 1.0
+  rtimer.fn()
+  local x1 = pos_xs()[1]
+  return x0 - x1                  -- 每秒推进的舞台单位
+end
+OPT.speed = "0.2"
+local v_short = measure_speed_u("SHORT")
+local v_long = measure_speed_u(string.rep("L", 40))
+print(string.format("速度(短/长): %d / %d U/s", v_short, v_long))
+assert(math.abs(v_short - v_long) <= 2,
+  "长短弹幕速度不一致（应相同）: " .. v_short .. " vs " .. v_long)
+assert(math.abs(v_short - 0.2 * 1920) <= 3,
+  "速度与 speed 参数不符（应为 0.2*1920=384）: " .. v_short)
+print("OK: speed 参数生效（0.2 屏宽/秒，与文字长度无关）")
+
+-- ============ 9d. 窗口尺寸无关：任意窗口下「穿过一屏的时间」相同 ============
+-- 旧实现把 PlayRes 固定成 1920x1080 交给 libass 拉伸，窗口一变宽高比就被拉歪：
+-- 相对窗口的横向速度会变，弹幕越挤越多。现在 overlay 画布 = 屏幕像素、坐标按
+-- 视频显示矩形换算，所以「每秒穿过多少屏宽」恒等于 speed。
+local function measure_speed_screens()
+  FAKE_FILES.jsonl = dm("w", "WWWWWWWWWW", 16777215, 1, 25) .. "\n"
+  FAKE_TIME = FAKE_TIME + 60
+  timer.fn()
+  local xs = pos_xs()
+  local x0 = xs[#xs]
+  FAKE_TIME = FAKE_TIME + 1.0
+  rtimer.fn()
+  xs = pos_xs()
+  local x1 = xs[#xs]
+  -- 视频显示宽度（屏幕像素）= osd 宽 - 左右黑边
+  local dim = props["osd-dimensions"]
+  local vw = dim.w - (dim.ml or 0) - (dim.mr or 0)
+  return (x0 - x1) / vw
+end
+-- 16:9 小窗（无黑边）
+props["osd-dimensions"] = {w = 1280, h = 720, ml = 0, mt = 0, mr = 0, mb = 0}
+local s_169 = measure_speed_screens()
+-- 4:3 窗口里放 16:9 视频（上下黑边各 75px）：视频区只有 800x450
+props["osd-dimensions"] = {w = 800, h = 600, ml = 0, mt = 75, mr = 0, mb = 75}
+local s_43 = measure_speed_screens()
+-- 超宽窗口（左右黑边）
+props["osd-dimensions"] = {w = 1400, h = 500, ml = 200, mt = 0, mr = 200, mb = 0}
+local s_wide = measure_speed_screens()
+print(string.format("屏宽/秒: 16:9=%.3f 4:3窗=%.3f 超宽=%.3f", s_169, s_43, s_wide))
+assert(math.abs(s_169 - 0.2) < 0.01, "16:9 小窗速度不是 0.2 屏宽/秒: " .. s_169)
+assert(math.abs(s_43 - s_169) < 0.01,
+  "带黑边窗口速度变了（旧 bug）: " .. s_43 .. " vs " .. s_169)
+assert(math.abs(s_wide - s_169) < 0.01,
+  "超宽窗口速度变了（旧 bug）: " .. s_wide .. " vs " .. s_169)
+-- overlay 画布必须等于当前屏幕像素尺寸，否则 libass 会再次拉伸
+assert(overlay_res.x == 1400 and overlay_res.y == 500,
+  "overlay res 不是当前屏幕像素尺寸: " .. tostring(overlay_res.x) .. "x" .. tostring(overlay_res.y))
+print("OK: 窗口缩放 / 黑边都不改变弹幕速度（恒为 speed 屏宽/秒）")
+props["osd-dimensions"] = nil
+OPT.speed = ""  -- 恢复默认（空 = 用 duration_marquee 固定秒数）
+
 -- ============ 10b. 预处理：截断到第一个冒号，去掉"用户名：" ============
 -- 回归点：全角「：」是 3 字节，若用 [：:] 字符类会被逐字节拆开、从字中间切断
 FAKE_FILES.jsonl = dm("小明", "你好啊", 16777215, 1, 25) .. "\n"

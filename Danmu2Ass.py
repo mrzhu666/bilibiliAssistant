@@ -208,7 +208,18 @@ def ConvertFlashRotation(rotY, rotZ, X, Y, width, height):
     return (trX, trY, WrapAngle(outX), WrapAngle(outY), WrapAngle(outZ), scaleXY * 100, scaleXY * 100)
 
 
-def ProcessComments(comments, f, width, height, bottomReserved, fontface, fontsize, alpha, duration_marquee, duration_still, filters_regex, reduced, progress_callback):
+def MarqueeDuration(c, width, speed, duration_marquee):
+    """滚动弹幕时长。speed>0 时按固定速度算：时长 = (屏宽 + 文字宽) / 速度。
+
+    速度统一后，长弹幕只是在屏更久，不会像"固定秒数"那样越长跑得越快。
+    单位：屏宽/秒（speed=0.1 即约 10 秒穿过一屏，不含文字自身宽度）。
+    """
+    if speed > 0:
+        return (width + c[8]) / (speed * width)
+    return duration_marquee
+
+
+def ProcessComments(comments, f, width, height, bottomReserved, fontface, fontsize, alpha, duration_marquee, duration_still, filters_regex, reduced, progress_callback, speed=0):
     styleid = 'Danmaku2ASS_%04x' % random.randint(0, 0xffff)
     WriteASSHead(f, width, height, fontface, fontsize, alpha, styleid)
     rows = [[None] * (height - bottomReserved + 1) for i in range(4)]
@@ -226,10 +237,10 @@ def ProcessComments(comments, f, width, height, bottomReserved, fontface, fontsi
             # row = 0
             rowmax = height - bottomReserved - i[7]
             for row in range(int(rowmax)):
-                freerows = TestFreeRows(rows, i, row, width, height, bottomReserved, duration_marquee, duration_still)
+                freerows = TestFreeRows(rows, i, row, width, height, bottomReserved, duration_marquee, duration_still, speed)
                 if freerows >= i[7]:
                     MarkCommentRow(rows, i, row)
-                    WriteComment(f, i, row, width, height, bottomReserved, fontsize, duration_marquee, duration_still, styleid)
+                    WriteComment(f, i, row, width, height, bottomReserved, fontsize, duration_marquee, duration_still, styleid, speed)
                     break
             # while row <= rowmax:
             #     freerows = TestFreeRows(rows, i, row, width, height, bottomReserved, duration_marquee, duration_still)
@@ -243,7 +254,7 @@ def ProcessComments(comments, f, width, height, bottomReserved, fontface, fontsi
                 if not reduced:
                     row = FindAlternativeRow(rows, i, height, bottomReserved)
                     MarkCommentRow(rows, i, row)
-                    WriteComment(f, i, row, width, height, bottomReserved, fontsize, duration_marquee, duration_still, styleid)
+                    WriteComment(f, i, row, width, height, bottomReserved, fontsize, duration_marquee, duration_still, styleid, speed)
         elif i[4] == 'bilipos':
             WriteCommentBilibiliPositioned(f, i, width, height, styleid)
         elif i[4] == 'acfunpos':
@@ -254,7 +265,7 @@ def ProcessComments(comments, f, width, height, bottomReserved, fontface, fontsi
         progress_callback(len(comments), len(comments))
 
 
-def TestFreeRows(rows, c, row, width, height, bottomReserved, duration_marquee, duration_still):
+def TestFreeRows(rows, c, row, width, height, bottomReserved, duration_marquee, duration_still, speed=0):
     res = 0
     rowmax = height - bottomReserved
     targetRow = None
@@ -267,15 +278,16 @@ def TestFreeRows(rows, c, row, width, height, bottomReserved, duration_marquee, 
             row += 1
             res += 1
     else:
+        duration = MarqueeDuration(c, width, speed, duration_marquee)
         try:
-            thresholdTime = c[0] - duration_marquee * (1 - width / (c[8] + width))
+            thresholdTime = c[0] - duration * (1 - width / (c[8] + width))
         except ZeroDivisionError:
-            thresholdTime = c[0] - duration_marquee
+            thresholdTime = c[0] - duration
         while row < rowmax and res < c[7]:
             if targetRow != rows[c[4]][row]:
                 targetRow = rows[c[4]][row]
                 try:
-                    if targetRow and (targetRow[0] > thresholdTime or targetRow[0] + targetRow[8] * duration_marquee / (targetRow[8] + width) > c[0]):
+                    if targetRow and (targetRow[0] > thresholdTime or targetRow[0] + MarqueeDuration(targetRow, width, speed, duration_marquee) * width / (targetRow[8] + width) > c[0]):
                         break
                 except ZeroDivisionError:
                     pass
@@ -325,7 +337,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     )
 
 
-def WriteComment(f, c, row, width, height, bottomReserved, fontsize, duration_marquee, duration_still, styleid):
+def WriteComment(f, c, row, width, height, bottomReserved, fontsize, duration_marquee, duration_still, styleid, speed=0):
     text = ASSEscape(c[3])
     styles = []
     if c[4] == 1:
@@ -336,10 +348,10 @@ def WriteComment(f, c, row, width, height, bottomReserved, fontsize, duration_ma
         duration = duration_still
     elif c[4] == 3:
         styles.append('\\move(%(neglen)d, %(row)d, %(width)d, %(row)d)' % {'width': width, 'row': row, 'neglen': -math.ceil(c[8])})
-        duration = duration_marquee
+        duration = MarqueeDuration(c, width, speed, duration_marquee)
     else:
         styles.append('\\move(%(width)d, %(row)d, %(neglen)d, %(row)d)' % {'width': width, 'row': row, 'neglen': -math.ceil(c[8])})
-        duration = duration_marquee
+        duration = MarqueeDuration(c, width, speed, duration_marquee)
     if not (-1 < c[6] - fontsize < 1):
         styles.append('\\fs%.0f' % c[6])
     if c[5] != 0xffffff:
@@ -454,7 +466,7 @@ def getComments(cid,font_size = 25):
     # print(comments[2])
     return comments
 
-def write2file(comments, directory, stage_width, stage_height,reserve_blank=0, font_face=_('(FONT) sans-serif')[7:], font_size=25.0, text_opacity=1.0, duration_marquee=5.0, duration_still=5.0, comment_filter=None, comment_filters_file=None, is_reduce_comments=False, progress_callback=None):
+def write2file(comments, directory, stage_width, stage_height,reserve_blank=0, font_face=_('(FONT) sans-serif')[7:], font_size=25.0, text_opacity=1.0, duration_marquee=5.0, duration_still=5.0, comment_filter=None, comment_filters_file=None, is_reduce_comments=False, progress_callback=None, speed=0):
     filters_regex = []
     
     if comment_filter and ( comment_filters or comment_filters_file):
@@ -477,7 +489,7 @@ def write2file(comments, directory, stage_width, stage_height,reserve_blank=0, f
         ass_path = ''.join([directory, '\\bilibili.ass'])
 
     with open(ass_path, 'w', encoding='utf-8', errors='replace') as fo:
-        ProcessComments(comments, fo, stage_width, stage_height, reserve_blank, font_face, font_size, text_opacity, duration_marquee, duration_still, filters_regex, is_reduce_comments, progress_callback)
+        ProcessComments(comments, fo, stage_width, stage_height, reserve_blank, font_face, font_size, text_opacity, duration_marquee, duration_still, filters_regex, is_reduce_comments, progress_callback, speed)
 
 def main():
     logging.basicConfig(format='%(levelname)s: %(message)s')
@@ -497,6 +509,8 @@ def main():
     parser.add_argument('-a', '--alpha', metavar=_('ALPHA'), help=_('Text opacity'), type=float, default=0.95) # initial = 1.0
     # 滚动弹幕显示的持续时间
     parser.add_argument('-dm', '--duration-marquee', metavar=_('SECONDS'), help=_('Duration of scrolling comment display [default: %s]') % 5, type=float, default=10.0) # initial = 5.0
+    # 滚动弹幕速度（屏宽/秒，0 = 关闭，退回 -dm 的固定秒数）
+    parser.add_argument('-sp', '--speed', metavar=_('SCREENS_PER_SECOND'), help=_('Scrolling comment speed in screen widths per second (0 = use --duration-marquee)'), type=float, default=0.0)
     # 静止弹幕显示的持续时间
     parser.add_argument('-ds', '--duration-still', metavar=_('SECONDS'), help=_('Duration of still comment display [default: %s]') % 5, type=float, default=5.0)
     # 正则表达式过滤评论
@@ -518,7 +532,7 @@ def main():
         raise ValueError(_('Invalid stage size: %r') % args.size)
     comments = getComments(args.cid,args.fontsize)
     # print("get scripts folder {}, will download comments on folder subs".format(directory))
-    write2file(comments, directory, width, height, args.protect, args.font, args.fontsize, args.alpha,  args.duration_marquee, args.duration_still, args.filter, args.filter_file, args.reduce)
+    write2file(comments, directory, width, height, args.protect, args.font, args.fontsize, args.alpha,  args.duration_marquee, args.duration_still, args.filter, args.filter_file, args.reduce, speed=args.speed)
 
 if __name__ == "__main__":
     

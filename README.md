@@ -17,9 +17,15 @@ mpv B站播放增强插件：点播弹幕自动加载 + 直播间实时弹幕。
 
 1. 新增 B站直播间实时弹幕（`live_danmu.py` + `main.lua` 直播分支），点播那套字号 / 透明度 / 排版 / 描边规则原样复用
 2. 新增 B站直播自动重连（`live_status.py` + `main.lua` 看门狗）：掉线 / 卡顿自愈，重载即同画质换线路，主播下播则等待重开
-3. 去掉了 `Danmu2Ass.exe`，只保留 `Danmu2Ass.py`（纯标准库，无第三方依赖）
-4. 配置命名空间冻结为 `bilibiliAssistant`（`options.read_options(o, "bilibiliAssistant")`）
-5. 不推荐 External Player，推荐“网址进 mpv + yt-dlp 解析 + mpv-quality-menu 选画质”流程（见下文）
+3. **滚动弹幕改为固定速度**（`speed` 参数，屏宽/秒）：所有弹幕速度一致，长弹幕只是在屏更久；
+   旧版按「固定秒数」滚动，长弹幕会被逼着跑得更快、窗口一缩小相对速度就变慢并越挤越多。
+   点播（`Danmu2Ass.py -sp`）与直播（`main.lua`）共用同一个速度语义。
+4. **弹幕画布跟随视频显示矩形**：overlay 的 `res_x/res_y` 取当前 `osd-dimensions` 像素尺寸，
+   字号 / 位移 / 描边按「视频显示高度 / 舞台高」实时换算，所以拖窄窗口、加黑边都不会
+   把弹幕拉歪或从屏幕中间冒出来（旧版固定 PlayRes 1920x1080 交给 libass 拉伸，宽高比一变就漂）。
+5. 去掉了 `Danmu2Ass.exe`，只保留 `Danmu2Ass.py`（纯标准库，无第三方依赖）
+6. 配置命名空间冻结为 `bilibiliAssistant`（`options.read_options(o, "bilibiliAssistant")`）
+7. 不推荐 External Player，推荐“网址进 mpv + yt-dlp 解析 + mpv-quality-menu 选画质”流程（见下文）
 
 ## 安装
 
@@ -123,7 +129,8 @@ mpv --script-opts-append="cid=<cid>" <视频文件>
 | `fontname` | `sans-serif` | 弹幕字体 |
 | `fontsize` | `50` | 弹幕字号 |
 | `opacity` | `0.95` | 不透明度 0-1 |
-| `duration_marquee` | `10` | 滚动弹幕持续秒数 |
+| `speed` | （空） | 滚动弹幕速度，单位「屏宽/秒」，`0`/空 = 关闭改用 `duration_marquee` |
+| `duration_marquee` | `10` | 滚动弹幕持续秒数（`speed` 生效时仅作兜底） |
 | `duration_still` | `5` | 顶部 / 底部固定弹幕持续秒数 |
 | `percent` | `0.75` | 底部保留空白比例 0-1（防挡字幕） |
 | `filter_file` | （空） | 弹幕屏蔽关键词文件路径 |
@@ -131,6 +138,20 @@ mpv --script-opts-append="cid=<cid>" <视频文件>
 | `use_python` | `yes` | 固定走 `Danmu2Ass.py` |
 | `python_path` | `python` | Python 解释器路径 |
 | `log_osd` | `no` | 是否在 OSD 显示日志 |
+
+### 滚动速度：`speed` 与 `duration_marquee`
+
+`speed` 是「屏宽/秒」，`duration_marquee` 是「固定秒数」，二者只取其一（`speed` 优先）。
+
+| 参数 | 语义 | 长弹幕 | 窗口变小 |
+|---|---|---|---|
+| `speed=0.10`（推荐） | 每秒穿过 0.10 个屏宽 | 速度不变，在屏更久 | 速度不变 |
+| `duration_marquee=20`（旧） | 每条都在屏 20 秒 | 被逼着跑得更快 | 相对窗口变慢，越挤越多 |
+
+换算：`speed ≈ 1 / 期望穿过一屏的秒数`。`0.10` ≈ 10 秒，`0.2` ≈ 5 秒。
+实际在屏时长 = `(屏宽 + 文字宽) / speed / 屏宽`，所以长弹幕会久一点，这是刻意设计。
+
+B站网页播放器就是固定速度语义（长弹幕在屏更久，不会越长越快），这也是本插件现在的默认行为。
 
 直播（样式与排版完全套用上方点播配置）：
 
@@ -195,7 +216,6 @@ mpv --script-opts-append="cid=<cid>" <视频文件>
 - 广告跳过
 - 高能进度条
 - SC 滞留显示
-- 弹幕速度一致（直播与点播对齐）
 - 个人屏蔽词拉取
 
 ## 相关项目
