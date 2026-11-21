@@ -61,6 +61,20 @@ local o = {
 	--彩色弹幕调暗系数(0.3-1.0，1=不调)。黄/蓝等饱和色发亮刺眼时调低即可。
 	--只作用于彩色弹幕，默认白字(FFFFFF)与黑字不受影响。
 	live_color_dim = "0.75",
+	--直播自动重连：掉线 / 卡顿自愈。详见下方「直播自动重连」小节
+	live_reconnect = "yes",
+	--判定“卡顿”的阈值：paused-for-cache 持续多少秒就重载换线路
+	live_stall_sec = "2",
+	--time-pos 冻结多少秒判定为卡死（paused-for-cache 没触发时的兜底）
+	live_freeze_sec = "10",
+	--两次自动重载的最小间隔（秒），防重载风暴
+	live_cooldown = "20",
+	--熔断窗口（秒）内最多自动重载几次，超过即停止尝试并提示
+	live_max_reload = "4",
+	--开播 / 重载后多少秒内不自动动作，避开初始缓冲
+	live_start_delay = "15",
+	--断线等待重连时，轮询直播间状态的间隔（秒）
+	live_rewait_sec = "30",
 }
 
 options.read_options(o, "bilibiliAssistant")
@@ -103,8 +117,9 @@ local live_visible = true
 local live_room = nil
 local live_danmu_open = false -- 直播弹幕是否处于开启状态（供 Add_fps_vf 判断）
 
-local function get_live_room()
-	if o.live_enable ~= "yes" then return nil end
+-- 从可能保留原始 URL 的属性里识别直播间号。
+-- 不依赖 live_enable：自动重连要能在“关掉直播弹幕但保留重连”时独立判断。
+local function live_room_from_url()
 	local room = mp.get_opt("live_room")
 	if room and room ~= "" then
 		local manual = room:match("(%d+)")
@@ -125,6 +140,11 @@ local function get_live_room()
 		end
 	end
 	return nil
+end
+
+local function get_live_room()
+	if o.live_enable ~= "yes" then return nil end
+	return live_room_from_url()
 end
 
 -- Lua 5.1 无 utf8 库，手动数 UTF-8 字符（等价 Danmu2Ass 的 CalculateLength）
@@ -578,6 +598,292 @@ local function Live_toggle()
 	Live_render()
 	return true
 end
+-- ============ B站直播自动重连 ============
+-- 背景：B站直播的 CDN 直链带签名且会过期（实测 expires 约 1 小时），yt-dlp
+-- 只在加载时解析一次、不会续期；单条线路也可能被 B站切走。两者都表现为播放
+-- 中途停下（mpv 因 keep-open 转入 idle），用户只能重开 mpv。
+--
+-- 本模块用 1 秒一次的轻量看门狗，检测到「卡顿」或「流结束」时把当前播放列表
+-- 条目重新加载一次（playlist-play-index current）。重载会重新跑 yt-dlp 解析，
+-- 拿到一条全新的带签名直链，并且实测大概率换到另一条 CDN 线路——所以“重载”
+-- 本身就是“同画质换线路”。
+--
+-- 为什么用 playlist-play-index current 而不是 loadfile：前者复用当前播放列表
+-- 条目，保留 file-local-options（画质选择等）；后者新建条目会丢掉这些选项。
+--
+-- 流结束时先查直播间状态（live_status.py）再决定：状态“在播”才重载（判定为
+-- CDN 掉线 / URL 过期）；状态“未播”说明主播确实下播，转入等待轮询，检测到
+-- 重新开播再重载，绝不空转。
+--
+-- 资源占用：看门狗只是每秒读几个属性，不产生进程、不联网；live_status.py 只在
+-- 等待重连阶段按 live_rewait_sec 轮询，是短命进程，正常播放时零额外开销。
+local live_reconnect_on = tostring(o.live_reconnect) == "yes"
+local live_watch_timer = nil   -- 1s 看门狗
+local live_wait_timer = nil    -- 等待重连时的状态轮询定时器
+local live_reload_guard = nil  -- 重载收尾超时兜底定时器
+local live_watching = false    -- 是否正在监护当前直播间
+local live_waiting = false      -- 是否处于“等待主播重新开播”状态
+local live_room_reconnect = nil -- 正在监护的直播间号
+local live_stall_since = nil    -- paused-for-cache 持续为 yes 的起点
+local live_freeze_since = nil   -- time-pos 停止推进的起点
+local live_last_tp = nil        -- 上一次见到的 time-pos
+local live_eof_handled = false  -- 本轮是否已处理过 eof-reached
+local live_eof_since = nil      -- eof-reached 持续为 yes 的起点
+local live_reload_count = 0     -- 熔断窗口内的自动重载次数
+local live_reload_since = 0     -- 熔断窗口起点
+local live_cooldown_until = 0   -- 冷却截止时刻
+local live_grace_until = 0      -- 开播 / 重载后的宽限期截止时刻
+-- 重载进行中的标志：分别由 Danmaku_terminate 与本模块的 end-file 各自消费，
+-- 与监听器注册顺序无关，避免“跳过弹幕清理”和“保持看门狗”互相打架
+local live_skip_danmu_stop = false
+local live_keep_watch = false
+-- 熔断窗口长度（秒）：窗口内重载次数超限即停止自动尝试
+local live_reload_window = 120
+-- eof-reached 需要持续为 yes 多少秒才认定流真的结束（直播下该属性会偶发抖动）
+local live_eof_sec = 3
+
+-- 收尾：停掉所有定时器并清空状态（切台 / 关掉直播 / 重载失败时调用）
+local function live_reconnect_stop()
+	if live_watch_timer then live_watch_timer:kill() live_watch_timer = nil end
+	if live_wait_timer then live_wait_timer:kill() live_wait_timer = nil end
+	if live_reload_guard then live_reload_guard:kill() live_reload_guard = nil end
+	live_watching = false
+	live_waiting = false
+	live_room_reconnect = nil
+	live_stall_since = nil
+	live_freeze_since = nil
+	live_last_tp = nil
+	live_eof_handled = false
+	live_eof_since = nil
+	live_reload_count = 0
+	live_reload_since = 0
+	live_cooldown_until = 0
+	live_grace_until = 0
+	live_skip_danmu_stop = false
+	live_keep_watch = false
+end
+
+-- 查直播间状态：true=在播 / false=未播 / nil=无法判定
+local function live_query_status(room)
+	local py_path = utils.join_path(mp.get_script_directory(), "live_status.py")
+	local ok, val = pcall(mp.command_native, {
+		name = "subprocess",
+		playback_only = false,
+		capture_stdout = true,
+		args = { o.python_path, py_path, room },
+	})
+	if not ok or val == nil then return nil end
+	-- command_native 对 subprocess 返回的是结果表（stdout 在 val.stdout 里），
+	-- 不是裸字符串；两种形态都兼容，避免以后 mpv 版本差异直接判成“未知”
+	local out = val
+	if type(val) == "table" then out = val.stdout end
+	if type(out) ~= "string" then return nil end
+	local s = out:gsub("[\r\n]", "")
+	if s == "1" then return true end
+	if s == "0" then return false end
+	return nil
+end
+
+-- 重载当前直播流：重新解析 + 大概率换线路。force=true 时跳过熔断（手动触发）
+local function live_reload(reason, force)
+	if not live_room_reconnect then return false end
+	local now = mp.get_time()
+	if not force and now < live_cooldown_until then
+		return false
+	end
+	if not force and live_reload_count >= (tonumber(o.live_max_reload) or 4) then
+		log("直播自动重连已达上限，停止尝试")
+		mp.osd_message("直播重连已达上限，请手动按 Ctrl+Shift+L", 4)
+		return false
+	end
+	-- 标记“本次结束由我们发起”，让 Danmaku_terminate 保留弹幕、
+	-- 让本模块的 end-file 不退出监护；两个标志分别被各自的消费者清掉
+	live_skip_danmu_stop = true
+	live_keep_watch = true
+	live_reload_count = live_reload_count + 1
+	live_reload_since = now
+	live_cooldown_until = now + (tonumber(o.live_cooldown) or 20)
+	live_grace_until = now + (tonumber(o.live_start_delay) or 15)
+	live_stall_since = nil
+	live_freeze_since = nil
+	live_eof_handled = false
+	live_eof_since = nil
+	log("直播重载：" .. reason)
+	mp.osd_message(reason, 2.5)
+	-- 复用当前播放列表条目：保留画质等 file-local-options
+	mp.commandv("playlist-play-index", "current")
+	-- 兜底：若重载没换来新的 file-loaded（解析失败等），清标志并停止监护，
+	-- 免得残留标志让后面正常的切台不清理弹幕
+	if live_reload_guard then live_reload_guard:kill() end
+	live_reload_guard = mp.add_timeout(20.0, function()
+		live_reload_guard = nil
+		if live_skip_danmu_stop or live_keep_watch then
+			live_skip_danmu_stop, live_keep_watch = false, false
+			live_reconnect_stop()
+			log("直播重载未完成，停止自动重连")
+		end
+	end)
+	return true
+end
+
+-- 进入“等待主播重新开播”：不重载、不空转，按间隔轮询直播间状态
+local function live_enter_wait(note)
+	live_waiting = true
+	if live_wait_timer then live_wait_timer:kill() end
+	log("直播等待重连：" .. tostring(note))
+	mp.osd_message("直播已断开，等待重连…", 3)
+	local interval = tonumber(o.live_rewait_sec) or 30
+	if interval < 5 then interval = 5 end
+	live_wait_timer = mp.add_periodic_timer(interval, function()
+		if not live_waiting then return end
+		local live = live_query_status(live_room_reconnect)
+		if live then
+			if live_reload("检测到直播恢复，重新连接") then
+				live_waiting = false
+				if live_wait_timer then live_wait_timer:kill() live_wait_timer = nil end
+			end
+		elseif live == nil then
+			mp.osd_message("直播状态未知，继续等待…", 2.5)
+		else
+			mp.osd_message("直播已断开，等待重连…", 2.5)
+		end
+	end)
+end
+
+-- eof-reached 已持续为 yes：查直播间状态，区分“掉线”和“主播下播”
+local function live_handle_eof()
+	live_eof_handled = true
+	local live = live_query_status(live_room_reconnect)
+	if live then
+		live_reload("直播流断开，重新连接")
+	elseif live == nil then
+		live_enter_wait("状态未知")
+	else
+		live_enter_wait("主播未开播")
+	end
+end
+
+-- 1 秒一次的看门狗
+local function live_watchdog_tick()
+	if not live_watching or live_waiting then return end
+	local now = mp.get_time()
+	if now < live_grace_until or now < live_cooldown_until then return end
+	-- 重载 / 切台的过渡期这些属性都是 nil，清计时不做判断
+	local paused_cache = mp.get_property("paused-for-cache")
+	if paused_cache == nil then
+		live_stall_since = nil
+		live_freeze_since = nil
+		return
+	end
+	-- 熔断窗口过期则清零重载次数
+	if live_reload_count > 0 and now - live_reload_since > live_reload_window then
+		live_reload_count = 0
+	end
+	-- 1) 卡顿：paused-for-cache 持续为 yes
+	if paused_cache == "yes" then
+		if live_stall_since == nil then live_stall_since = now end
+		if now - live_stall_since >= (tonumber(o.live_stall_sec) or 2) then
+			live_reload("直播卡顿，自动切换线路")
+			return
+		end
+	else
+		live_stall_since = nil
+	end
+	-- 2) 卡死兜底：用户没暂停，但 time-pos 一直不推进
+	if mp.get_property_native("paused") then return end
+	local tp = mp.get_property_native("time-pos")
+	if tp == nil then return end
+	if tp ~= live_last_tp then
+		live_last_tp = tp
+		live_freeze_since = nil
+	else
+		if live_freeze_since == nil then live_freeze_since = now end
+		if now - live_freeze_since >= (tonumber(o.live_freeze_sec) or 10) then
+			live_reload("直播无进展，自动重新连接")
+		end
+	end
+	-- 3) 流结束：eof-reached 需持续为 yes 才认定（直播下该属性会偶发抖动，
+	--    瞬时 yes 不动作，避免误触发重载）
+	if mp.get_property_native("eof-reached") then
+		if live_eof_since == nil then live_eof_since = now end
+		if now - live_eof_since >= live_eof_sec and not live_eof_handled then
+			live_handle_eof()
+		end
+	else
+		live_eof_since = nil
+	end
+end
+
+-- 开始监护：识别到直播间就挂上看门狗
+local function live_reconnect_start()
+	if not live_reconnect_on then
+		live_reconnect_stop()
+		return
+	end
+	local room = live_room_from_url()
+	if not room then
+		live_reconnect_stop()
+		return
+	end
+	if live_watch_timer then
+		-- 同一场直播的重复加载（重载后重连）：只刷新宽限期与标志，不重启定时器
+		-- （重启会清掉重载计数，让熔断永远不触发）
+		live_room_reconnect = room
+		live_grace_until = mp.get_time() + (tonumber(o.live_start_delay) or 15)
+		live_eof_handled = false
+		live_stall_since, live_freeze_since, live_last_tp, live_eof_since = nil, nil, nil, nil
+		return
+	end
+	live_room_reconnect = room
+	live_watching = true
+	live_waiting = false
+	live_eof_handled = false
+	live_eof_since = nil
+	live_stall_since = nil
+	live_freeze_since = nil
+	live_last_tp = nil
+	live_grace_until = mp.get_time() + (tonumber(o.live_start_delay) or 15)
+	live_watch_timer = mp.add_periodic_timer(1.0, live_watchdog_tick)
+end
+
+-- 重载收尾 / 状态复位
+local function live_reconnect_on_file_loaded()
+	live_skip_danmu_stop = false
+	live_keep_watch = false
+	if live_reload_guard then live_reload_guard:kill() live_reload_guard = nil end
+	live_reconnect_start()
+end
+
+-- 本模块的 end-file：自己发起的重载保持监护，其余正常收尾
+local function live_reconnect_on_end_file()
+	if live_keep_watch then
+		live_keep_watch = false
+		return
+	end
+	-- 非重载引起的结束：清掉可能残留的标志，正常收尾
+	live_skip_danmu_stop = false
+	live_reconnect_stop()
+end
+
+-- 手动重载（Ctrl+Shift+L）：不依赖自动重连开关，强制重载一次
+local function live_reconnect_manual()
+	local room = live_room_from_url()
+	if not room then
+		log("当前不是 B站直播间，无需重载")
+		mp.osd_message("当前不是 B站直播间", 2)
+		return
+	end
+	if live_reconnect_on then
+		live_reconnect_start()
+	end
+	live_room_reconnect = room
+	live_reload("手动重载直播流", true)
+end
+
+mp.register_event("file-loaded", live_reconnect_on_file_loaded)
+mp.register_event("end-file", live_reconnect_on_end_file)
+mp.add_key_binding(nil, 'reload', live_reconnect_manual)
+-- ============ 直播自动重连结束 ============
 -- ============ 直播部分结束 ============
 
 local function get_cid()
@@ -757,7 +1063,13 @@ end
 
 -- remove danmaku
 function Danmaku_terminate()
-	Live_stop() -- 直播模式：杀子进程、清 overlay、删 jsonl，无 danmu_file 也要执行
+	if live_skip_danmu_stop then
+		-- 本次结束由插件自己发起的重载引起：保留弹幕子进程与 jsonl，
+		-- 跨重载无缝延续，避免每次自动恢复弹幕都闪断
+		live_skip_danmu_stop = false
+	else
+		Live_stop() -- 直播模式：杀子进程、清 overlay、删 jsonl，无 danmu_file 也要执行
+	end
 	if not danmu_file then return end
 	log('文件结束')
 	if file_exists(danmu_file) then

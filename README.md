@@ -9,15 +9,17 @@ mpv B站播放增强插件：点播弹幕自动加载 + 直播间实时弹幕。
 
 - 点播弹幕：播放 B站视频时自动下载弹幕并转为 ASS 加载，观感与 B站网页播放器一致
 - 直播弹幕：播放 `live.bilibili.com` 时自动连接弹幕服务器实时显示，含普通弹幕与 SC，样式与点播弹幕完全对齐
+- 直播自动重连：直播掉线或缓冲跟不上时自动重新解析并加载（重解析即同画质换 CDN 线路）；主播确实下播则转入等待，检测到重新开播自动接回
 - 低帧率自动提帧（`<45fps` 且 `<1.5` 倍速时自动加 `fps=60` 滤镜，保证滚动弹幕流畅）
-- 按 `b` 一键显示 / 隐藏弹幕
+- 按 `b` 一键显示 / 隐藏弹幕，按 `Ctrl+Shift+L` 手动重载当前直播流
 
 ## 与上游的区别
 
 1. 新增 B站直播间实时弹幕（`live_danmu.py` + `main.lua` 直播分支），点播那套字号 / 透明度 / 排版 / 描边规则原样复用
-2. 去掉了 `Danmu2Ass.exe`，只保留 `Danmu2Ass.py`（纯标准库，无第三方依赖）
-3. 配置命名空间冻结为 `bilibiliAssistant`（`options.read_options(o, "bilibiliAssistant")`）
-4. 不推荐 External Player，推荐“网址进 mpv + yt-dlp 解析 + mpv-quality-menu 选画质”流程（见下文）
+2. 新增 B站直播自动重连（`live_status.py` + `main.lua` 看门狗）：掉线 / 卡顿自愈，重载即同画质换线路，主播下播则等待重开
+3. 去掉了 `Danmu2Ass.exe`，只保留 `Danmu2Ass.py`（纯标准库，无第三方依赖）
+4. 配置命名空间冻结为 `bilibiliAssistant`（`options.read_options(o, "bilibiliAssistant")`）
+5. 不推荐 External Player，推荐“网址进 mpv + yt-dlp 解析 + mpv-quality-menu 选画质”流程（见下文）
 
 ## 安装
 
@@ -29,7 +31,8 @@ mpv B站播放增强插件：点播弹幕自动加载 + 直播间实时弹幕。
 <mpv配置目录>/scripts/bilibiliAssistant/
 ├── main.lua
 ├── Danmu2Ass.py
-└── live_danmu.py
+├── live_danmu.py
+└── live_status.py
 ```
 
 如果 `python` 不在系统 PATH，在 `script-opts/bilibiliAssistant.conf` 里指定解释器路径：
@@ -77,7 +80,22 @@ bilibiliAssistant-mincount=1
 播放 `live.bilibili.com` 时自动启动，无需任何操作。
 匿名连接默认带 `buvid`，弹幕量与登录连接一致。按 `b` 切换显示。
 
-### 4. 手动加载（本地视频配线上弹幕）
+### 4. 直播自动重连
+
+直播播放中无需任何操作，看门狗会自动处理两类问题：
+
+- **掉线 / 缓冲跟不上**：自动重新解析并加载当前直播流。重解析会拿到一条全新的带签名
+  CDN 直链，并大概率换到另一条线路，因此“重载”本身就是**同画质换线路**。重载复用当前
+  播放列表条目，画质选择等设置不会丢。
+- **主播确实下播**：不会空转重载，转入静默等待；轮询到直播间重新开播后自动接回，OSD
+  会提示当前状态。
+
+重载期间直播弹幕不会中断（抓取子进程跨重载延续，不会闪断）。
+
+按 `Ctrl+Shift+L` 可随时手动重载当前直播流——**改完 cookie 文件后按它即可生效，
+不用重开 mpv**。
+
+### 5. 手动加载（本地视频配线上弹幕）
 
 先自行获取视频的 cid（devtools 控制台输入 `cid`，或用取 cid 的油猴脚本），然后：
 
@@ -129,12 +147,30 @@ mpv --script-opts-append="cid=<cid>" <视频文件>
 | `live_outline_color` | `default` | 描边色，`default`=继承 mpv OSD / `black` / `white` / `RRGGBB` |
 | `live_color_dim` | `0.75` | 彩色弹幕调暗系数 0.3-1.0，`1`=不调；白字黑字不受影响 |
 
+直播自动重连（与上方直播弹幕的样式配置无关）：
+
+| 选项 | 默认值 | 说明 |
+|---|---|---|
+| `live_reconnect` | `yes` | 是否启用直播自动重连 |
+| `live_stall_sec` | `2` | 卡顿阈值：`paused-for-cache` 持续多少秒就重载换线路 |
+| `live_freeze_sec` | `10` | `time-pos` 冻结多少秒判定卡死（`paused-for-cache` 没触发时的兜底） |
+| `live_cooldown` | `20` | 两次自动重载的最小间隔（秒），防重载风暴 |
+| `live_max_reload` | `4` | 熔断窗口（120s）内最多自动重载几次，超过即停止并提示 |
+| `live_start_delay` | `15` | 开播 / 重载后多少秒内不自动动作，避开初始缓冲 |
+| `live_rewait_sec` | `30` | 断线等待重连时，轮询直播间状态的间隔（秒） |
+
 ## 快捷键
 
-`b` 显示 / 隐藏弹幕（点播与直播通用）。换键位可在 `input.conf` 里改：
+| 键 | 作用 |
+|---|---|
+| `b` | 显示 / 隐藏弹幕（点播与直播通用） |
+| `Ctrl+Shift+L` | 手动重载当前直播流（重新解析并换线路；改完 cookie 后用它生效） |
+
+换键位可在按键配置里改（本仓库为 `input_uosc.conf`）：
 
 ```
 <key> script-binding bilibiliAssistant/toggle
+<key> script-binding bilibiliAssistant/reload
 ```
 
 ## 加载原理
@@ -150,6 +186,9 @@ mpv --script-opts-append="cid=<cid>" <视频文件>
 1. 从播放地址识别房间号（或 `live_room` 手动指定）
 2. `live_danmu.py` 子进程直连弹幕服务器写 `jsonl`（短号自动换真实房间号，断线重连）
 3. `main.lua` 高频定时器重绘 OSD overlay，通道占用与追尾判定等价于 `Danmu2Ass` 的 `TestFreeRows` / `MarkCommentRow`
+4. 自动重连看门狗每秒检查 `paused-for-cache` / `time-pos` / `eof-reached`，判定卡顿或掉线时用
+   `playlist-play-index current` 重载（重新解析即换线路）；流结束时由 `live_status.py` 查直播间状态，
+   在播才重载，未播则按 `live_rewait_sec` 轮询等待重开
 
 ## 路线图
 
