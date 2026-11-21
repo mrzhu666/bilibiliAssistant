@@ -90,18 +90,24 @@ bilibiliAssistant-mincount=1
 
 ### 4. 直播自动重连
 
-直播播放中无需任何操作，看门狗会自动处理两类问题：
+直播播放中无需任何操作，看门狗会自动处理三类问题：
 
-- **掉线 / 缓冲跟不上**：自动重新解析并加载当前直播流。重解析会拿到一条全新的带签名
-  CDN 直链，并大概率换到另一条线路，因此“重载”本身就是**同画质换线路**。重载复用当前
-  播放列表条目，画质选择等设置不会丢。
-- **主播确实下播**：不会空转重载，转入静默等待；轮询到直播间重新开播后自动接回，OSD
-  会提示当前状态。
+- **卡顿 / 断流僵死**：断流后 mpv 常有一段"僵死期"——界面还在、`idle-active` 仍是 `no`，
+  只有 `time-pos` 完全冻结、`demuxer-cache-duration` 不再增长。看门狗靠这对信号识别，
+  自动重新解析并加载，**重解析会拿到新的带签名 CDN 直链并大概率换线路**，因此"重载"
+  本身就是**同画质换线路**。
+- **已经掉回 idle**（界面变默认界面、中间一直转圈）：这是必须恢复的终态，看门狗会
+  **绕过冷却期**立即处理，不会让用户干等。
+- **主播确实下播**：不会空转重载，转入静默等待；轮询到重新开播后自动接回，OSD 提示状态。
 
 重载期间直播弹幕不会中断（抓取子进程跨重载延续，不会闪断）。
 
 按 `Ctrl+Shift+L` 可随时手动重载当前直播流——**改完 cookie 文件后按它即可生效，
 不用重开 mpv**。
+
+> 实现说明：播放列表还有有效条目时用 `playlist-play-index`（保留画质选择）；
+> 断流后 `playlist-pos` 会变成 `-1`，此时 `current` 已不存在，必须退回
+> `loadfile <房间URL>`，画质会回到 yt-dlp 默认值——这是断流恢复的必要代价。
 
 ### 5. 手动加载（本地视频配线上弹幕）
 
@@ -193,10 +199,10 @@ B站网页播放器就是固定速度语义（长弹幕在屏更久，不会越�
 |---|---|---|
 | `live_reconnect` | `yes` | 是否启用直播自动重连 |
 | `live_stall_sec` | `2` | 卡顿阈值：`paused-for-cache` 持续多少秒就重载换线路 |
-| `live_freeze_sec` | `10` | `time-pos` 冻结多少秒判定卡死（`paused-for-cache` 没触发时的兜底） |
+| `live_freeze_sec` | `8` | `time-pos` 冻结多少秒判定卡死（断流“僵死期”的主判据） |
 | `live_cooldown` | `20` | 两次自动重载的最小间隔（秒），防重载风暴 |
 | `live_max_reload` | `4` | 熔断窗口（120s）内最多自动重载几次，超过即停止并提示 |
-| `live_start_delay` | `15` | 开播 / 重载后多少秒内不自动动作，避开初始缓冲 |
+| `live_start_delay` | `8` | 开播 / 重载后多少秒内不自动动作，避开初始缓冲 |
 | `live_rewait_sec` | `30` | 断线等待重连时，轮询直播间状态的间隔（秒） |
 
 ## 快捷键
@@ -226,9 +232,11 @@ B站网页播放器就是固定速度语义（长弹幕在屏更久，不会越�
 1. 从播放地址识别房间号（或 `live_room` 手动指定）
 2. `live_danmu.py` 子进程直连弹幕服务器写 `jsonl`（短号自动换真实房间号，断线重连）
 3. `main.lua` 高频定时器重绘 OSD overlay，通道占用与追尾判定等价于 `Danmu2Ass` 的 `TestFreeRows` / `MarkCommentRow`
-4. 自动重连看门狗每秒检查 `paused-for-cache` / `time-pos` / `eof-reached`，判定卡顿或掉线时用
-   `playlist-play-index current` 重载（重新解析即换线路）；流结束时由 `live_status.py` 查直播间状态，
-   在播才重载，未播则按 `live_rewait_sec` 轮询等待重开
+4. 自动重连看门狗每秒检查 `idle-active` / `paused-for-cache` / `time-pos` 与
+   `demuxer-cache-duration` / `eof-reached`：已掉回 idle 立即恢复（绕过冷却）；卡顿或
+   `time-pos` 冻结且缓存不再增长时用 `playlist-play-index`（或 `loadfile`）重载，重解析
+   即换线路；流结束时由 `live_status.py` 查直播间状态，在播才重载，未播则按
+   `live_rewait_sec` 轮询等待重开
 
 ## 路线图
 

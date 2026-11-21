@@ -74,14 +74,20 @@ local o = {
 	live_reconnect = "yes",
 	--判定“卡顿”的阈值：paused-for-cache 持续多少秒就重载换线路
 	live_stall_sec = "2",
-	--time-pos 冻结多少秒判定为卡死（paused-for-cache 没触发时的兜底）
-	live_freeze_sec = "10",
+	--time-pos 冻结多少秒判定为卡死。
+	--实测断流后 mpv 会有一段“僵死期”：idle-active 仍是 no、playlist-pos 仍是 0、
+	--eof-reached 仍是 no，只有 time-pos 完全冻结（本地实测持续 30 秒以上才转
+	--idle）。这段期间用户看到的就是画面卡住，所以必须靠它尽早发现并换线。
+	--默认 8 秒：兼顾“别把 HLS 分片边界的短暂停滞误判”和“别让用户干等”。
+	live_freeze_sec = "8",
 	--两次自动重载的最小间隔（秒），防重载风暴
 	live_cooldown = "20",
 	--熔断窗口（秒）内最多自动重载几次，超过即停止尝试并提示
 	live_max_reload = "4",
-	--开播 / 重载后多少秒内不自动动作，避开初始缓冲
-	live_start_delay = "15",
+	--开播 / 重载后多少秒内不自动动作，避开初始缓冲。
+	--注意：这个宽限期只影响“卡顿/卡死”判据；已经掉回 idle 的终态恢复不受它限制。
+	--默认 8 秒：够等 yt-dlp 解析 + 首帧出图，又不至于让真断流白等太久。
+	live_start_delay = "8",
 	--断线等待重连时，轮询直播间状态的间隔（秒）
 	live_rewait_sec = "30",
 }
@@ -715,15 +721,20 @@ end
 -- ============ B站直播自动重连 ============
 -- 背景：B站直播的 CDN 直链带签名且会过期（实测 expires 约 1 小时），yt-dlp
 -- 只在加载时解析一次、不会续期；单条线路也可能被 B站切走。两者都表现为播放
--- 中途停下（mpv 因 keep-open 转入 idle），用户只能重开 mpv。
+-- 中途停下：mpv 触发 end-file(reason=error/eof)，播放列表被清到 playlist-pos=-1，
+-- 界面退回 uosc 的 idle 转圈，用户只能重开 mpv。
 --
--- 本模块用 1 秒一次的轻量看门狗，检测到「卡顿」或「流结束」时把当前播放列表
--- 条目重新加载一次（playlist-play-index current）。重载会重新跑 yt-dlp 解析，
--- 拿到一条全新的带签名直链，并且实测大概率换到另一条 CDN 线路——所以“重载”
--- 本身就是“同画质换线路”。
+-- 本模块用 1 秒一次的轻量看门狗，检测到「卡顿」「流结束」「退回 idle」时重新
+-- 加载直播间 URL。加载会重新跑 yt-dlp 解析，拿到一条全新的带签名直链，并且实测
+-- 大概率换到另一条 CDN 线路——所以“重载”本身就是“同画质换线路”。
 --
--- 为什么用 playlist-play-index current 而不是 loadfile：前者复用当前播放列表
--- 条目，保留 file-local-options（画质选择等）；后者新建条目会丢掉这些选项。
+-- 重载原语必须分两种情况（实测结论，别想当然）：
+--   1) 播放列表还有有效条目（playlist-pos >= 0）：用 playlist-play-index <idx>，
+--      复用条目可保留 file-local-options（画质选择等）。
+--   2) 断流后 playlist-pos 已变成 -1（“current”不存在了）：playlist-play-index
+--      current 完全无效，必须退回 loadfile <房间URL> replace。
+--      代价是 file-local-options 丢失、回到 yt-dlp 默认画质——这是断流恢复的
+--      必要代价，总比停在 idle 强。
 --
 -- 流结束时先查直播间状态（live_status.py）再决定：状态“在播”才重载（判定为
 -- CDN 掉线 / URL 过期）；状态“未播”说明主播确实下播，转入等待轮询，检测到
@@ -738,11 +749,14 @@ local live_reload_guard = nil  -- 重载收尾超时兜底定时器
 local live_watching = false    -- 是否正在监护当前直播间
 local live_waiting = false      -- 是否处于“等待主播重新开播”状态
 local live_room_reconnect = nil -- 正在监护的直播间号
+local live_url = nil            -- 重载用的直播间 URL（loadfile 降级路径需要）
 local live_stall_since = nil    -- paused-for-cache 持续为 yes 的起点
 local live_freeze_since = nil   -- time-pos 停止推进的起点
 local live_last_tp = nil        -- 上一次见到的 time-pos
-local live_eof_handled = false  -- 本轮是否已处理过 eof-reached
-local live_eof_since = nil      -- eof-reached 持续为 yes 的起点
+local live_last_cache = nil     -- 上一次见到的 demuxer-cache-duration（判断缓存是否还在增长）
+local live_idle_since = nil     -- 退回 idle（播放列表被清空）的起点
+local live_eof_handled = false  -- 本轮是否已处理过流结束
+local live_eof_since = nil      -- 流结束信号持续存在的起点
 local live_reload_count = 0     -- 熔断窗口内的自动重载次数
 local live_reload_since = 0     -- 熔断窗口起点
 local live_cooldown_until = 0   -- 冷却截止时刻
@@ -753,8 +767,10 @@ local live_skip_danmu_stop = false
 local live_keep_watch = false
 -- 熔断窗口长度（秒）：窗口内重载次数超限即停止自动尝试
 local live_reload_window = 120
--- eof-reached 需要持续为 yes 多少秒才认定流真的结束（直播下该属性会偶发抖动）
+-- 流结束信号需要持续多少秒才认定真的结束（直播下 eof-reached 会偶发抖动）
 local live_eof_sec = 3
+-- 退回 idle 后等多少秒再判定需要重载（给 mpv 内部收尾留出时间）
+local live_idle_sec = 2
 
 -- 收尾：停掉所有定时器并清空状态（切台 / 关掉直播 / 重载失败时调用）
 local function live_reconnect_stop()
@@ -764,9 +780,12 @@ local function live_reconnect_stop()
 	live_watching = false
 	live_waiting = false
 	live_room_reconnect = nil
+	live_url = nil
 	live_stall_since = nil
 	live_freeze_since = nil
 	live_last_tp = nil
+	live_last_cache = nil
+	live_idle_since = nil
 	live_eof_handled = false
 	live_eof_since = nil
 	live_reload_count = 0
@@ -824,17 +843,38 @@ local function live_reload(reason, force)
 	live_eof_since = nil
 	log("直播重载：" .. reason)
 	mp.osd_message(reason, 2.5)
-	-- 复用当前播放列表条目：保留画质等 file-local-options
-	mp.commandv("playlist-play-index", "current")
-	-- 兜底：若重载没换来新的 file-loaded（解析失败等），清标志并停止监护，
-	-- 免得残留标志让后面正常的切台不清理弹幕
+	-- 选重载原语：断流后 playlist-pos 会变成 -1，此时 "current" 不存在，
+	-- playlist-play-index current 是空操作（实测无效），必须退回 loadfile。
+	local pos = mp.get_property_number("playlist-pos")
+	if pos ~= nil and pos >= 0 then
+		-- 播放列表条目还在：复用它可以保留画质等 file-local-options
+		mp.commandv("playlist-play-index", tostring(pos))
+	else
+		-- 播放列表已失效：只能按 URL 重新加载，画质会回到 yt-dlp 默认值。
+		-- live_url 万一没记录到，用房间号现拼一个兜底。
+		local url = live_url
+		if not url and live_room_reconnect then
+			url = "https://live.bilibili.com/" .. live_room_reconnect
+		end
+		if not url then
+			log("直播重载失败：没有可用的直播间 URL")
+			return false
+		end
+		mp.commandv("loadfile", url, "replace")
+	end
+	-- 兜底：若重载没换来新的 file-loaded（解析失败 / 网络仍不通），
+	-- 不能就此停掉看门狗——那正是“一直转圈”的来源。这里只清标志、
+	-- 复位状态，让看门狗继续用 idle 判据重试（受熔断保护）。
 	if live_reload_guard then live_reload_guard:kill() end
 	live_reload_guard = mp.add_timeout(20.0, function()
 		live_reload_guard = nil
-		if live_skip_danmu_stop or live_keep_watch then
-			live_skip_danmu_stop, live_keep_watch = false, false
-			live_reconnect_stop()
-			log("直播重载未完成，停止自动重连")
+		live_skip_danmu_stop, live_keep_watch = false, false
+		if live_watching then
+			live_eof_handled = false
+			live_eof_since = nil
+			live_idle_since = nil
+			live_stall_since, live_freeze_since, live_last_tp, live_last_cache = nil, nil, nil, nil
+			log("直播重载未完成，继续监护")
 		end
 	end)
 	return true
@@ -852,7 +892,9 @@ local function live_enter_wait(note)
 		if not live_waiting then return end
 		local live = live_query_status(live_room_reconnect)
 		if live then
-			if live_reload("检测到直播恢复，重新连接") then
+			-- 等待阶段每次轮询都是一次独立的恢复机会，不受冷却期限制
+			-- （否则冷却未过时永远重载不了，会一直卡在等待）
+			if live_reload("检测到直播恢复，重新连接", true) then
 				live_waiting = false
 				if live_wait_timer then live_wait_timer:kill() live_wait_timer = nil end
 			end
@@ -864,12 +906,17 @@ local function live_enter_wait(note)
 	end)
 end
 
--- eof-reached 已持续为 yes：查直播间状态，区分“掉线”和“主播下播”
-local function live_handle_eof()
+-- eof-reached 已持续为 yes / 已退回 idle：查直播间状态，区分“掉线”和“主播下播”
+-- from_idle=true 表示已经掉回 idle（必须恢复的终态），此时重载绕过冷却期
+local function live_handle_eof(from_idle)
 	live_eof_handled = true
 	local live = live_query_status(live_room_reconnect)
 	if live then
-		live_reload("直播流断开，重新连接")
+		if live_reload(from_idle and "直播已断开，重新连接" or "直播流断开，重新连接",
+			from_idle and true or false) then
+			-- 重载已发起：复位，让后续（若又失败）还能再次尝试
+			live_eof_handled = false
+		end
 	elseif live == nil then
 		live_enter_wait("状态未知")
 	else
@@ -881,17 +928,37 @@ end
 local function live_watchdog_tick()
 	if not live_watching or live_waiting then return end
 	local now = mp.get_time()
-	if now < live_grace_until or now < live_cooldown_until then return end
-	-- 重载 / 切台的过渡期这些属性都是 nil，清计时不做判断
+	if now < live_grace_until then return end
+
+	-- 0) 最高优先级：已经退回 idle（界面变默认界面 + 转圈）。
+	--    断流时 mpv 会触发 end-file(error) 并把 playlist-pos 置 -1，此时
+	--    paused-for-cache / time-pos / eof-reached 全是 nil，下面所有判据都会
+	--    失效。必须单独靠 idle-active 抓这种情况，否则永远救不回来。
+	--    idle 是“必须恢复”的终态，因此这里**绕过冷却期**：刚重载失败又掉回
+	--    idle 时如果还等冷却，用户就会盯着转圈干等一整个冷却期。
+	if mp.get_property_native("idle-active") then
+		if live_idle_since == nil then live_idle_since = now end
+		if now - live_idle_since >= live_idle_sec then
+			live_idle_since = nil
+			live_handle_eof(true)
+		end
+		return
+	end
+	live_idle_since = nil
+
+	-- 其余判据（卡顿 / 卡死 / eof）受冷却期保护，避免重载风暴
+	if now < live_cooldown_until then return end
+	-- 熔断窗口过期则清零重载次数
+	if live_reload_count > 0 and now - live_reload_since > live_reload_window then
+		live_reload_count = 0
+	end
+
+	-- 过渡期（重载 / 切台）这些属性可能是 nil，清计时不做判断
 	local paused_cache = mp.get_property("paused-for-cache")
 	if paused_cache == nil then
 		live_stall_since = nil
 		live_freeze_since = nil
 		return
-	end
-	-- 熔断窗口过期则清零重载次数
-	if live_reload_count > 0 and now - live_reload_since > live_reload_window then
-		live_reload_count = 0
 	end
 	-- 1) 卡顿：paused-for-cache 持续为 yes
 	if paused_cache == "yes" then
@@ -903,16 +970,28 @@ local function live_watchdog_tick()
 	else
 		live_stall_since = nil
 	end
-	-- 2) 卡死兜底：用户没暂停，但 time-pos 一直不推进
+	-- 2) 卡死：用户没暂停，但 time-pos 一直不推进。
+	--    这是断流“僵死期”的主要判据（见 live_freeze_sec 注释）。
+	--    为了不把正常缓冲误判成卡死，同时要求 demuxer 缓存也不再增长：
+	--    真断流时缓存会停在一个值不动，正常缓冲则缓存还在往里填。
 	if mp.get_property_native("paused") then return end
 	local tp = mp.get_property_native("time-pos")
 	if tp == nil then return end
+	local cachedur = mp.get_property_number("demuxer-cache-duration")
 	if tp ~= live_last_tp then
 		live_last_tp = tp
 		live_freeze_since = nil
+		live_last_cache = cachedur
 	else
-		if live_freeze_since == nil then live_freeze_since = now end
-		if now - live_freeze_since >= (tonumber(o.live_freeze_sec) or 10) then
+		if live_freeze_since == nil then
+			live_freeze_since = now
+			live_last_cache = cachedur
+		elseif cachedur ~= nil and live_last_cache ~= nil and cachedur > live_last_cache + 0.05 then
+			-- 缓存还在增长：说明只是播放端在等，流本身有数据，不算卡死
+			live_freeze_since = now
+			live_last_cache = cachedur
+		end
+		if now - live_freeze_since >= (tonumber(o.live_freeze_sec) or 8) then
 			live_reload("直播无进展，自动重新连接")
 		end
 	end
@@ -945,7 +1024,9 @@ local function live_reconnect_start()
 		live_room_reconnect = room
 		live_grace_until = mp.get_time() + (tonumber(o.live_start_delay) or 15)
 		live_eof_handled = false
-		live_stall_since, live_freeze_since, live_last_tp, live_eof_since = nil, nil, nil, nil
+		live_eof_since = nil
+		live_idle_since = nil
+		live_stall_since, live_freeze_since, live_last_tp, live_last_cache = nil, nil, nil, nil
 		return
 	end
 	live_room_reconnect = room
@@ -953,9 +1034,11 @@ local function live_reconnect_start()
 	live_waiting = false
 	live_eof_handled = false
 	live_eof_since = nil
+	live_idle_since = nil
 	live_stall_since = nil
 	live_freeze_since = nil
 	live_last_tp = nil
+	live_last_cache = nil
 	live_grace_until = mp.get_time() + (tonumber(o.live_start_delay) or 15)
 	live_watch_timer = mp.add_periodic_timer(1.0, live_watchdog_tick)
 end
@@ -965,18 +1048,43 @@ local function live_reconnect_on_file_loaded()
 	live_skip_danmu_stop = false
 	live_keep_watch = false
 	if live_reload_guard then live_reload_guard:kill() live_reload_guard = nil end
+	-- 记录可用于 loadfile 降级的直播间 URL（断流后播放列表会失效）
+	local url = live_room_from_url()
+	if url then
+		live_url = "https://live.bilibili.com/" .. url
+	end
 	live_reconnect_start()
 end
 
--- 本模块的 end-file：自己发起的重载保持监护，其余正常收尾
-local function live_reconnect_on_end_file()
+-- 本模块的 end-file。
+-- 关键：必须按 reason 区分“用户主动结束”和“流自己断掉”：
+--   stop / quit  = 用户意图（按了停止、关窗口），必须停掉看门狗，否则会把
+--                  用户主动关掉的直播重新拉起来。
+--   error / eof  = 流自己断掉（CDN 掉线、签名过期、分片 404），**绝不能**停
+--                  看门狗——此时 mpv 已把播放列表清空、属性全变 nil，只有看门狗
+--                  靠 idle-active 才能发现并自愈。这正是“退回默认界面一直转圈”
+--                  的成因，早期版本在这里误停了看门狗。
+--   redirect     = mpv 内部重定向，忽略。
+local function live_reconnect_on_end_file(ev)
+	local reason = tostring((ev and ev.reason) or "unknown")
 	if live_keep_watch then
+		-- 自己发起的重载：保持监护，等 file-loaded 收尾
 		live_keep_watch = false
 		return
 	end
-	-- 非重载引起的结束：清掉可能残留的标志，正常收尾
+	if reason == "stop" or reason == "quit" then
+		-- 用户主动结束：正常收尾，不再自愈
+		live_skip_danmu_stop = false
+		live_reconnect_stop()
+		return
+	end
+	if reason == "redirect" then return end
+	-- error / eof / unknown：保留看门狗与监护状态，让它在下一步靠
+	-- idle-active / eof-reached 发现断流并自愈
 	live_skip_danmu_stop = false
-	live_reconnect_stop()
+	live_eof_handled = false
+	live_eof_since = nil
+	live_idle_since = nil
 end
 
 -- 手动重载（Ctrl+Shift+L）：不依赖自动重连开关，强制重载一次
