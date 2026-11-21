@@ -23,9 +23,11 @@ mpv B站播放增强插件：点播弹幕自动加载 + 直播间实时弹幕。
 4. **弹幕画布跟随视频显示矩形**：overlay 的 `res_x/res_y` 取当前 `osd-dimensions` 像素尺寸，
    字号 / 位移 / 描边按「视频显示高度 / 舞台高」实时换算，所以拖窄窗口、加黑边都不会
    把弹幕拉歪或从屏幕中间冒出来（旧版固定 PlayRes 1920x1080 交给 libass 拉伸，宽高比一变就漂）。
-5. 去掉了 `Danmu2Ass.exe`，只保留 `Danmu2Ass.py`（纯标准库，无第三方依赖）
-6. 配置命名空间冻结为 `bilibiliAssistant`（`options.read_options(o, "bilibiliAssistant")`）
-7. 不推荐 External Player，推荐“网址进 mpv + yt-dlp 解析 + mpv-quality-menu 选画质”流程（见下文）
+5. **直播弹幕样式显式对齐点播**：文字色 / 描边色显式输出（不再继承 mpv OSD 的紫字白边），
+   字体默认跟随 `--sub-font`，使直播与点播的字体、颜色、描边完全一致
+6. 去掉了 `Danmu2Ass.exe`，只保留 `Danmu2Ass.py`（纯标准库，无第三方依赖）
+7. 配置命名空间冻结为 `bilibiliAssistant`（`options.read_options(o, "bilibiliAssistant")`）
+8. 不推荐 External Player，推荐“网址进 mpv + yt-dlp 解析 + mpv-quality-menu 选画质”流程（见下文）
 
 ## 安装
 
@@ -126,7 +128,7 @@ mpv --script-opts-append="cid=<cid>" <视频文件>
 |---|---|---|
 | `autoplay` | `yes` | 打开即显示 / `no`=默认隐藏 |
 | `mincount` | `1` | 小于此估算弹幕数不自动显示 |
-| `fontname` | `sans-serif` | 弹幕字体 |
+| `fontname` | `sans-serif` | 弹幕字体。留默认时自动跟随 mpv 的 `--sub-font`，与点播弹幕同一字体 |
 | `fontsize` | `50` | 弹幕字号 |
 | `opacity` | `0.95` | 不透明度 0-1 |
 | `speed` | （空） | 滚动弹幕速度，单位「屏宽/秒」，`0`/空 = 关闭改用 `duration_marquee` |
@@ -153,6 +155,23 @@ mpv --script-opts-append="cid=<cid>" <视频文件>
 
 B站网页播放器就是固定速度语义（长弹幕在屏更久，不会越长越快），这也是本插件现在的默认行为。
 
+### 字体 / 颜色与点播对齐
+
+直播弹幕用 `osd-overlay` 渲染，样式默认来自 mpv 的 OSD 设置，而点播弹幕是 ASS 字幕、
+样式来自 `--sub-font` 等字幕设置。两者不是一套，直接沿用会出现：
+
+- 白色弹幕变成 mpv 的 `osd-color`（本机是紫色 `#672168`）
+- 描边变成 `osd-outline-color`（近白 `#EEEEEE`），而点播是黑边
+- 中文字形回退到 `osd-font`（微软雅黑），而点播回退到 `sub-font`（楷体）
+
+所以直播分支显式输出 `\c` / `\3c`，并在 `fontname` 留默认时改用 `--sub-font`。
+真机 libass 日志可以确认两边现在落在同一字体：
+
+```
+[osd/libass] fontselect: (LXGW WenKai Mono Lite, 700, 0) -> LXGWWenKaiMonoLite-Regular   ← 直播
+[sub/ass]   Using default font family:              -> LXGWWenKaiMonoLite-Regular        ← 点播
+```
+
 直播（样式与排版完全套用上方点播配置）：
 
 | 选项 | 默认值 | 说明 |
@@ -165,7 +184,7 @@ B站网页播放器就是固定速度语义（长弹幕在屏更久，不会越�
 | `live_trim` | `yes` | 已播弹幕直接删除不囤积 / `no`=保留 |
 | `live_prefix` | `trim` | `trim`=截断到第一个冒号去掉“用户名：”（默认）/ `no`=保留完整 / `trim_keep`=保留用户名 |
 | `live_prefix_drop_empty` | `yes` | 截断后为空的弹幕是否丢弃 |
-| `live_outline_color` | `default` | 描边色，`default`=继承 mpv OSD / `black` / `white` / `RRGGBB` |
+| `live_outline_color` | `black` | 描边色，`black`=与点播一致 / `white` / `RRGGBB` / `default`=继承 mpv OSD（旧行为，紫字白边） |
 | `live_color_dim` | `0.75` | 彩色弹幕调暗系数 0.3-1.0，`1`=不调；白字黑字不受影响 |
 
 直播自动重连（与上方直播弹幕的样式配置无关）：

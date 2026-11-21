@@ -211,7 +211,28 @@ assert(overlay_data:find("\\fs50", 1, true), "字号不对（应为 fontsize=50�
 assert(overlay_data:find("\\q2", 1, true), "缺少 \\q2（换行策略）")
 print("OK: 字体/字号/样式显式声明")
 
--- ============ 4. 重绘定时器：高频推进，位移严格均匀 ============
+-- ============ 3b. 字体：默认跟随 --sub-font，与点播弹幕落在同一字体 ============
+-- 点播 ASS 写 sans-serif，但 libass 找不到中文字形，回退到 --sub-font（本机楷体）。
+-- 直播 overlay 走 OSD 字体链，回退目标是 --osd-font（微软雅黑），于是两边中文不同。
+-- 修复：o.fontname 仍是默认 sans-serif 时，改用 --sub-font。
+props["sub-font"] = "LXGW WenKai Mono Lite"
+FAKE_FILES.jsonl = dm("f", "FONTTEST", 16777215, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(overlay_data:find("\\fnLXGW WenKai Mono Lite", 1, true),
+  "默认应跟随 --sub-font（与点播同一字体），实际: "
+  .. tostring(overlay_data:match("\\fn[^\\]*")))
+-- 用户显式配了 fontname 时尊重用户配置
+OPT.fontname = "Microsoft YaHei"
+FAKE_FILES.jsonl = dm("f", "FONTTEST2", 16777215, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(overlay_data:find("\\fnMicrosoft YaHei", 1, true),
+  "显式 fontname 应被尊重")
+OPT.fontname = "sans-serif"
+print("OK: 字体默认跟随 --sub-font（与点播一致），显式 fontname 优先")
+
+
 -- 关键：必须用高频定时器而不是 observe_property("time-pos")。
 -- mpv 的属性事件是 coalesced 的，实测会隔帧丢（mpv#4195），重绘会不规律。
 assert(timers[2], "缺少重绘定时器")
@@ -265,24 +286,26 @@ FAKE_FILES.jsonl = dm("c", "GREEN", 0x00FF00, 1, 25) .. "\n"
 FAKE_TIME = FAKE_TIME + 60
 timer.fn()
 assert(overlay_data:find("\\c&H08FF14&", 1, true), "绿色未转到 08FF14")
--- 白色是特例：Danmu2Ass 直接返回 FFFFFF，且不需要 \c 标签
+-- 白色也必须显式输出 \c：直播 overlay 的样式是 mpv OSD（osd-color），
+-- 省略 \c 会继承 OSD 颜色（本机紫字 #672168），白字弹幕直接变紫。
+-- 点播那边能省略是因为 ASS 样式自带 PrimaryColour=&HFFFFFF。
 FAKE_FILES.jsonl = dm("c", "WHITE", 0xFFFFFF, 1, 25) .. "\n"
 FAKE_TIME = FAKE_TIME + 60
 timer.fn()
-assert(not overlay_data:find("\\c&HFFFFFF&", 1, true),
-  "白色不应输出 \\c（Danmu2Ass 会跳过 0xffffff）")
+assert(overlay_data:find("\\c&HFFFFFF&", 1, true),
+  "白色必须显式输出 \\c&HFFFFFF&（否则继承 mpv OSD 的紫字）")
 OPT.live_color_dim = "0.75" -- 恢复默认
-print("OK: 颜色转换与 Danmu2Ass 一致")
+print("OK: 颜色转换与 Danmu2Ass 一致（白色也显式输出 \\c）")
 
--- ============ 7b. 描边：默认继承 mpv OSD（不输出 \3c），可选显式指定 ============
--- 用户要求"恢复默认白边"：default 时应保持 mpv 原生 OSD 描边，不覆盖
-assert((OPT.live_outline_color or "default") == "default",
-  "默认描边应为 default（继承 mpv OSD）")
-FAKE_FILES.jsonl = dm("d", "NOOUTLINE", 0xFF0000, 1, 25) .. "\n"
+-- ============ 7b. 描边：默认黑边（与点播 Danmu2Ass 一致） ============
+-- 回归点：default 继承 mpv OSD 描边会让描边变成近白 #EEEEEE，与点播黑边不一致。
+assert((OPT.live_outline_color or "black") == "black",
+  "默认描边应为 black（与点播 Danmu2Ass 一致）")
+FAKE_FILES.jsonl = dm("d", "BLACKOUT", 0xFF0000, 1, 25) .. "\n"
 FAKE_TIME = FAKE_TIME + 60
 timer.fn()
-assert(not overlay_data:find("\\3c", 1, true),
-  "default 描边不应输出 \\3c（应继承 mpv 的 osd-outline-color）")
+assert(overlay_data:find("\\3c&H000000&", 1, true),
+  "默认应输出黑色描边 \\3c&H000000&（同点播 Danmu2Ass）")
 assert(overlay_data:find("\\c&H", 1, true), "彩色弹幕应输出文字色 \\c")
 -- 黑字特例：必须补白边，与描边设置无关（否则黑底看不见）
 FAKE_FILES.jsonl = dm("d", "BLACKTEXT", 0x000000, 1, 25) .. "\n"
@@ -290,23 +313,30 @@ FAKE_TIME = FAKE_TIME + 60
 timer.fn()
 assert(overlay_data:find("\\c&H000000&\\3c&HFFFFFF&", 1, true),
   "黑字未补白边")
--- 白色默认弹幕：Danmu2Ass 跳过 0xffffff，不应输出 \c
+-- 白色默认弹幕：必须显式输出 \c&HFFFFFF& + 黑边
 FAKE_FILES.jsonl = dm("d", "PLAINWHITE", 0xFFFFFF, 1, 25) .. "\n"
 FAKE_TIME = FAKE_TIME + 60
 timer.fn()
-assert(not overlay_data:find("\\c&HFFFFFF&", 1, true),
-  "白色弹幕不应输出 \\c（与 Danmu2Ass 一致）")
-print("OK: 描边默认继承 mpv OSD（黑字补白边、白色不出 \\c）")
+assert(overlay_data:find("\\c&HFFFFFF&\\3c&H000000&", 1, true),
+  "白色弹幕应为白字黑边（与点播渲染结果一致）")
+print("OK: 默认白字黑边，与点播 Danmu2Ass 渲染结果一致")
 
 -- 显式指定描边色仍可用（可选增强）
-OPT.live_outline_color = "black"
-FAKE_FILES.jsonl = dm("d", "BOUT", 0xFF0000, 1, 25) .. "\n"
+OPT.live_outline_color = "white"
+FAKE_FILES.jsonl = dm("d", "WOUT", 0xFF0000, 1, 25) .. "\n"
 FAKE_TIME = FAKE_TIME + 60
 timer.fn()
-assert(overlay_data:find("\\3c&H000000&", 1, true),
-  "live_outline_color=black 未生效")
+assert(overlay_data:find("\\3c&HFFFFFF&", 1, true),
+  "live_outline_color=white 未生效")
+-- default 仍可显式选择继承 mpv OSD（旧行为，留作对比）
 OPT.live_outline_color = "default"
-print("OK: live_outline_color 可选指定（black/white/RRGGBB）")
+FAKE_FILES.jsonl = dm("d", "OSDOUT", 0xFF0000, 1, 25) .. "\n"
+FAKE_TIME = FAKE_TIME + 60
+timer.fn()
+assert(not overlay_data:find("\\3c", 1, true),
+  "live_outline_color=default 应继承 mpv OSD（不输出 \\3c）")
+OPT.live_outline_color = "black"
+print("OK: live_outline_color 可指定（black 默认 / white / RRGGBB / default 继承 OSD）")
 
 -- ============ 7c. 调暗：默认开启，只作用彩色弹幕，白字不受影响 ============
 -- 纯红 0xFF0000 -> Danmu2Ass 矩阵 0200E9
@@ -321,12 +351,14 @@ local got = overlay_data:match("\\c&H(%x%x%x%x%x%x)&")
 print("  红色调暗后: " .. tostring(got))
 assert(got and got < "0200E9", "彩色弹幕未被调暗: " .. tostring(got))
 assert(got ~= "0200E9", "调暗系数无效")
--- 白字不受调暗影响（默认白字应保持不输出 \c）
+-- 白字不受调暗影响（白色仍是纯白 FFFFFF，只是显式输出 \c）
 FAKE_FILES.jsonl = dm("d", "DIMWHITE", 0xFFFFFF, 1, 25) .. "\n"
 FAKE_TIME = FAKE_TIME + 60
 timer.fn()
-assert(not overlay_data:find("\\c&H", 1, true),
-  "白字被调暗/染色了（应保持默认色不受影响）")
+assert(overlay_data:find("\\c&HFFFFFF&", 1, true),
+  "白字应显式输出纯白 \\c&HFFFFFF&（不受调暗影响）")
+assert(not overlay_data:find("\\c&H%x%x%x%x%x%x&[^\\]*\\c", 1, false),
+  "白字被调暗/染色了")
 -- dim=1.0 时完全还原
 OPT.live_color_dim = "1.0"
 FAKE_FILES.jsonl = dm("d", "NODIM", 0xFF0000, 1, 25) .. "\n"

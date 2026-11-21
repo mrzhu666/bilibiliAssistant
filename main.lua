@@ -9,7 +9,9 @@ local o = {
 	autoplay = true,
 	--最小弹幕数量
 	mincount = 1,
-	--弹幕字体
+	--弹幕字体。留默认 "sans-serif" 时自动跟随 mpv 的 --sub-font，
+	--这样直播弹幕与点播 ASS 弹幕落在同一字体（点播的中文字形就是回退到 sub-font 的）。
+	--显式填字体名则两边都用它。
 	fontname = "sans-serif",
 	--弹幕字体大小
 	fontsize = "50",
@@ -61,9 +63,10 @@ local o = {
 	live_prefix = "trim",
 	--前缀截断后又空了的弹幕是否丢弃（yes=丢弃该条 / no=保留原文）
 	live_prefix_drop_empty = "yes",
-	--弹幕描边色：default(默认，不覆盖，继承 mpv 的 osd-outline-color 白边)
-	--black / white / RRGGBB 可显式指定；想让彩色弹幕更清爽可设 black
-	live_outline_color = "default",
+	--弹幕描边色：black(默认，与点播 Danmu2Ass 一致)
+	--default=显式继承 mpv OSD 描边色（旧行为，紫字白边就是这么来的，仅作对比用）
+	--white / RRGGBB 也可显式指定
+	live_outline_color = "black",
 	--彩色弹幕调暗系数(0.3-1.0，1=不调)。黄/蓝等饱和色发亮刺眼时调低即可。
 	--只作用于彩色弹幕，默认白字(FFFFFF)与黑字不受影响。
 	live_color_dim = "0.75",
@@ -193,9 +196,27 @@ local function live_ass_escape(s)
 	return s:gsub("\\", "\\\\"):gsub("{", "\\{"):gsub("}", "\\}")
 end
 
--- 字体名转 ASS（与点播一样用 fontname；逗号前截断防注入）
+-- 字体名转 ASS。
+--
+-- 与点播对齐的关键：点播 ASS 的 Style Fontname 写的是 o.fontname（默认 sans-serif），
+-- 拉丁字形由 libass 解析成 Arial，而**中文字形 libass 里没有**，于是回退到
+-- mpv 传给 ass_set_fonts 的 default font —— 也就是 --sub-font（本机
+-- "LXGW WenKai Mono Lite" 楷体）。真机日志：
+--   [sub/ass] fontselect: (sans-serif, 700, 0) -> Arial-BoldMT
+--   [sub/ass] Using default font family: -> LXGWWenKaiMonoLite-Regular
+--
+-- 直播 overlay 走的是 OSD 字体链，同样的回退目标是 --osd-font（默认 sans-serif
+-- → 微软雅黑），于是中文变成了黑体，与点播的楷体观感完全不同：
+--   [osd/libass] fontselect: (sans-serif, 700, 0) -> MicrosoftYaHeiUI-Bold
+--
+-- 所以这里在 o.fontname 保持默认 sans-serif 时改用 --sub-font，让两条链路
+-- 落到同一个字体；用户显式配了 fontname 则尊重用户配置。
 local function live_font_tag()
 	local fn = tostring(o.fontname or "sans-serif"):match("^[^,]*") or "sans-serif"
+	if fn == "sans-serif" then
+		local sf = mp.get_property("sub-font")
+		if type(sf) == "string" and sf ~= "" then fn = sf end
+	end
 	fn = fn:gsub("\\", "\\\\"):gsub("{", "\\{"):gsub("}", "\\}")
 	return "\\fn" .. fn
 end
@@ -393,13 +414,20 @@ local function live_pos_x(it, now_ms, W)
 end
 
 -- 弹幕文字色 / 描边色 → ASS 颜色标签。
--- 描边默认 "default"：不输出 \3c，直接继承 mpv 的 OSD 样式
--- （即 mpv.conf 的 osd-outline-color，本机为近白 #EEEEEE），保持原生观感。
--- 若想让彩色弹幕更清爽，可设 live_outline_color=black（点播 Danmu2Ass 即黑边）。
--- live_outline_color: default / black / white / RRGGBB
+--
+-- ⚠ 关键：这里必须「显式输出」\c 与 \3c，不能靠继承。
+-- 点播 Danmu2Ass 可以省略它们，因为它的 ASS 样式本身就写了
+-- PrimaryColour=&HFFFFFF / OutlineColour=&H000000；而直播 overlay 的样式是
+-- mpv 的 OSD 样式（osd-color / osd-outline-color），本机是紫字 #672168 + 近白边
+-- #EEEEEE。省略标签会让白字弹幕直接变成紫字、黑边变成白边——这正是
+-- 「直播弹幕显示效果差」的根因（真机实测：白字渲染成 RGB(92,30,93)）。
+-- 所以两边要的是「最终渲染结果一致」，不是「标签串一致」。
+--
+-- live_outline_color: black(默认，与点播 Danmu2Ass 一致) / white / RRGGBB
+--                     default = 显式选择继承 mpv OSD 描边色（旧行为，可留作对比）
 local function live_outline_color_ass()
-	local v = tostring(o.live_outline_color or "default"):lower()
-	if v == "default" or v == "" then return nil end
+	local v = tostring(o.live_outline_color or "black"):lower()
+	if v == "default" or v == "" then return nil end -- 显式要求继承 OSD
 	if v == "white" then return "FFFFFF" end
 	if v == "black" then return "000000" end
 	-- 允许写 RRGGBB，转成 ASS 的 BGR 序
@@ -409,16 +437,14 @@ local function live_outline_color_ass()
 end
 
 -- 文字色(ASS BGR) + 描边色 → 颜色标签串。
--- 白色是"默认色"，Danmu2Ass 会跳过它不输出 \c；这里保持一致。
--- 黑字特例：补白边，否则在黑底上看不见（同 WriteComment）。
+-- 文字色始终输出（含白色），避免继承 mpv 的 osd-color。
+-- 黑字特例：补白边，否则在黑底上看不见（同 Danmu2Ass 的 WriteComment）。
 local function live_color_tag(color)
-	local out = ""
-	if color ~= "FFFFFF" then
-		out = "\\c&H" .. color .. "&"
-	end
+	local out = "\\c&H" .. color .. "&"
 	if color == "000000" then
 		return out .. "\\3c&HFFFFFF&"
 	end
+	-- 默认黑边；只有显式设 default 才不输出（继承 mpv OSD）
 	local oc = live_outline_color_ass()
 	if oc then
 		out = out .. "\\3c&H" .. oc .. "&"
