@@ -93,7 +93,9 @@ local o = {
 	live_merge_hold = "4",
 	--累计到第几条才折叠（前面的仍按普通滚动弹幕显示，保证单条观感不变）
 	live_merge_min = "2",
-	--同屏最多几条聚合弹幕（固定区不够时自动收敛；满了淘汰最久没更新的）
+	--同屏最多几条聚合弹幕（固定区不够时自动收敛）。
+	--满了不是按时间淘汰，而是只留「计数最多」的那几条：新来的/被挤下去的只要
+	--计数严格大于屏上最小计数就能顶替它上屏（并列不换），所以屏上恒为最热的那批。
 	live_merge_max = "10",
 	--显示文本超过该字数不参与聚合（0 = 不限）
 	live_merge_maxlen = "30",
@@ -537,6 +539,11 @@ end
 --   * 超过 hold 没有再次出现 → 固定弹幕消失、计数清零
 --   * 第 1 条（累计不到 live_merge_min）仍按普通滚动弹幕显示，不改变单条观感
 --   * 只聚合普通滚动弹幕（mode1）；SC / 图片 / 超长文本不参与
+--
+-- 固定区排满时按「计数」而不是「时间」决定谁上屏：
+--   * 屏上始终是计数最多的那几条（用最小堆维护「当前显示中最小的计数」）
+--   * 新来 / 被挤下去的那条，只要计数严格大于屏上最小计数，就替换它上来
+--   * 被挤下去的组不销毁（继续累计计数），所以计数涨上来还能再抢回位置
 local function live_agg_cfg()
 	local hold = (tonumber(o.live_merge_hold) or 4) * 1000
 	if hold < 500 then hold = 500 end
@@ -548,6 +555,73 @@ local function live_agg_cfg()
 	return hold, minc, maxn, maxlen
 end
 
+-- 最小堆（惰性删除）：只放「当前显示中」的聚合弹幕，堆顶就是计数最小那条。
+-- 计数一变就压入新条目 (count, key)，旧条目留在堆里；弹出时用
+-- 「条目 count == 该组当前 count 且仍在显示」校验，不匹配就丢掉。
+-- 为什么用堆而不是每次遍历：live_merge_max 可调到很大，且每条新弹幕都要
+-- 问一次「屏上最小是谁」，O(log n) 比 O(n) 更稳。n 很小时两者等价。
+local agg_heap = {}
+
+local function agg_less(a, b)
+	if a.count ~= b.count then return a.count < b.count end
+	return a.key < b.key -- 计数相同按 key 定序，保证行为可复现
+end
+
+local function agg_heap_push(e)
+	local h = agg_heap
+	h[#h + 1] = e
+	local i = #h
+	while i > 1 do
+		local p = math.floor(i / 2)
+		if not agg_less(h[i], h[p]) then break end
+		h[i], h[p] = h[p], h[i]
+		i = p
+	end
+end
+
+local function agg_heap_pop()
+	local h = agg_heap
+	local n = #h
+	if n == 0 then return nil end
+	local top = h[1]
+	h[1] = h[n]
+	h[n] = nil
+	n = n - 1
+	local i = 1
+	while true do
+		local l, r, s = i * 2, i * 2 + 1, i
+		if l <= n and agg_less(h[l], h[s]) then s = l end
+		if r <= n and agg_less(h[r], h[s]) then s = r end
+		if s == i then break end
+		h[i], h[s] = h[s], h[i]
+		i = s
+	end
+	return top
+end
+
+-- 惰性清理会攒下大量失效条目，超过阈值就按「当前显示中的组」重建
+local function agg_heap_compact()
+	if #agg_heap <= 128 then return end
+	agg_heap = {}
+	for k, g in pairs(live_agg) do
+		if g.item then agg_heap_push({ count = g.count, key = k }) end
+	end
+end
+
+-- 屏上计数最小的聚合弹幕。返回 count, key；没有显示中的聚合弹幕时返回 nil。
+local function live_agg_min_displayed()
+	while #agg_heap > 0 do
+		local e = agg_heap[1]
+		local g = live_agg[e.key]
+		-- 有效条目：组还在、仍在屏上、计数没变（变过就会压入新条目）
+		if g and g.item and g.count == e.count then
+			return e.count, e.key
+		end
+		agg_heap_pop()
+	end
+	return nil
+end
+
 local function live_agg_active()
 	local n = 0
 	for _, g in pairs(live_agg) do
@@ -556,53 +630,83 @@ local function live_agg_active()
 	return n
 end
 
-local function live_agg_drop(key)
+-- 让一条聚合弹幕下屏，但保留分组和计数（随时可以再抢回来）
+local function live_agg_unshow(g)
+	if not g or not g.item then return false end
+	g.item.end_ms = 0 -- 立刻从本帧起不再渲染
+	live_release(g.item)
+	g.item = nil
+	return true
+end
+
+-- 彻底丢弃一个分组（过期时用）
+local function live_agg_forget(key)
 	local g = live_agg[key]
 	if not g then return false end
-	if g.item then
-		g.item.end_ms = 0 -- 立刻从本帧起不再渲染
-		live_release(g.item)
-		g.item = nil
-	end
+	live_agg_unshow(g)
 	live_agg[key] = nil
 	return true
 end
 
--- 淘汰最久没有更新的聚合弹幕。只动聚合，绝不碰 SC / 原生固定弹幕。
-local function live_agg_evict_oldest()
-	local oldest_key, oldest_seen = nil, nil
-	for k, g in pairs(live_agg) do
-		if g.item and (oldest_seen == nil or g.last_seen < oldest_seen) then
-			oldest_key, oldest_seen = k, g.last_seen
-		end
-	end
-	if not oldest_key then return false end
-	return live_agg_drop(oldest_key)
+-- 挤掉「屏上计数最小」的那条聚合弹幕（只是下屏，分组保留）。
+-- 只动聚合，绝不碰 SC / 原生固定弹幕。
+local function live_agg_evict_min()
+	local _, key = live_agg_min_displayed()
+	if not key then return false end
+	return live_agg_unshow(live_agg[key])
 end
 
--- 在固定区申请一行，创建聚合用的顶部固定弹幕。
--- 从 fixed_top（= 舞台顶部）往下排：固定区与滚动区重叠是刻意设计，聚合弹幕
--- 和滚动弹幕是两套独立通道、互不避让（同 B站顶部弹幕与滚动弹幕的关系）。
-local function live_agg_spawn(g, now_ms, L, W, still_ms, hold)
+-- 让一条聚合弹幕上屏 / 原地更新。
+-- 返回 true = 已上屏（调用方不要再把这条弹幕当普通滚动弹幕排）；
+-- 返回 false = 没抢到位置（计数不够大），调用方照常滚动显示这一条。
+local function live_agg_show(g, now_ms, L, W, still_ms, hold)
 	local _, _, maxn = live_agg_cfg()
-	if live_agg_active() >= maxn then live_agg_evict_oldest() end
+
+	if g.item then
+		-- 已在屏：原地更新数字 + 续命。宽度按上屏时的字号算，避免中途改字号
+		-- 让占位宽度和实际渲染不一致。
+		g.item.text = g.text
+		g.item.w = utf8_len(g.text) * (g.item.fsize or g.fsize)
+		g.item.dur_ms = hold
+		g.item.end_ms = now_ms + hold
+		if g.item.occ then
+			g.item.occ.T = now_ms
+			g.item.occ.dur = hold
+		end
+		agg_heap_push({ count = g.count, key = g.key })
+		return true
+	end
+
+	-- 名额上限（live_merge_max）：满了同样按计数最小淘汰
+	if live_agg_active() >= maxn then
+		local minc = live_agg_min_displayed()
+		if not minc or g.count <= minc then return false end
+		live_agg_evict_min()
+	end
+
+	-- 固定区没空行：只有计数严格大于屏上最小那条，才抢它的位置
 	local y = live_find_fixed_row(L, g.fsize, now_ms, hold, g.w, W,
 		still_ms, 0, true)
-	if not y and live_agg_evict_oldest() then
+	if not y then
+		local minc = live_agg_min_displayed()
+		if not minc or g.count <= minc then return false end
+		live_agg_evict_min()
 		y = live_find_fixed_row(L, g.fsize, now_ms, hold, g.w, W,
 			still_ms, 0, true)
+		if not y then return false end
 	end
-	if not y then return nil end
+
 	local occ = { T = now_ms, len = g.w, fixed = true, dur = hold }
 	live_mark_fixed(y, g.fsize, occ)
-	local it = {
+	g.item = {
 		text = g.text, color_tag = g.color_tag, fsize = g.fsize,
 		an = 8, y = y, w = g.w, fixed = true,
 		born_ms = now_ms, dur_ms = hold, end_ms = now_ms + hold,
 		fixed_y = y, occ = occ, agg = true, agg_key = g.key,
 	}
-	live_items[#live_items + 1] = it
-	return it
+	live_items[#live_items + 1] = g.item
+	agg_heap_push({ count = g.count, key = g.key })
+	return true
 end
 
 -- 更新/创建聚合组。count 是该组的累计条数；force=true 时即使不到 min 也显示
@@ -614,7 +718,7 @@ local function live_agg_apply(key, base, color_tag, fsize, count,
 	local g = live_agg[key]
 	-- 上一轮已经过期：先把它彻底丢掉，避免复用旧 item
 	if g and (now_ms - g.last_seen) > hold then
-		live_agg_drop(key)
+		live_agg_forget(key)
 		g = nil
 	end
 	if not g then
@@ -623,33 +727,15 @@ local function live_agg_apply(key, base, color_tag, fsize, count,
 		live_agg[key] = g
 	end
 	g.color_tag = color_tag
-	g.fsize = fsize
 	g.count = count
 	g.last_seen = now_ms
 	if g.count < minc and not force then return false end
+	if not g.item then g.fsize = fsize end -- 已在屏的保持上屏时字号
 
 	g.text = g.base .. " ×" .. tostring(g.count)
-	g.w = utf8_len(g.text) * fsize
-
-	if not g.item then
-		g.item = live_agg_spawn(g, now_ms, L, W, still_ms, hold)
-		if not g.item then
-			-- 固定区真的没位置：退回普通显示（调用方会照常排行）
-			if g.count > 1 then g.count = g.count - 1 end
-			if g.count < 1 then live_agg[key] = nil end
-			return false
-		end
-	end
-	-- 原地更新：数字变大、寿命续到 now + hold
-	g.item.text = g.text
-	g.item.w = g.w
-	g.item.dur_ms = hold
-	g.item.end_ms = now_ms + hold
-	if g.item.occ then
-		g.item.occ.T = now_ms
-		g.item.occ.dur = hold
-	end
-	return true
+	g.w = utf8_len(g.text) * (g.item and g.item.fsize or fsize)
+	agg_heap_compact()
+	return live_agg_show(g, now_ms, L, W, still_ms, hold)
 end
 
 -- 过期清理：最后一次出现后超过 hold 就删组、释放行
@@ -657,10 +743,11 @@ local function live_agg_sweep(now_ms)
 	local hold = live_agg_cfg()
 	for k, g in pairs(live_agg) do
 		if (now_ms - g.last_seen) >= hold then
-			live_agg_drop(k)
+			live_agg_forget(k)
 		end
 	end
 end
+
 
 -- 单条滚动弹幕的当前横坐标（U）。
 -- 按「进度」实时重算，而不是把起终点定死在创建时：窗口尺寸/宽高比在飞行途中
@@ -932,8 +1019,8 @@ local function Live_poll()
 			local from_top = (ch == 1)
 			local y = live_find_fixed_row(L, h, now_ms, dur_ms, w, W,
 				still_ms, 0, from_top)
-			-- SC / 原生顶部弹幕优先：没位置时先挤掉最久没更新的聚合弹幕再试一次
-			if not y and from_top and live_agg_evict_oldest() then
+			-- SC / 原生顶部弹幕优先：没位置时先挤掉屏上计数最小的聚合弹幕再试一次
+			if not y and from_top and live_agg_evict_min() then
 				y = live_find_fixed_row(L, h, now_ms, dur_ms, w, W,
 					still_ms, 0, from_top)
 			end
@@ -983,6 +1070,7 @@ local function Live_start(room)
 	live_chan = {}
 	live_fixed = {}
 	live_agg = {}
+	agg_heap = {}
 	live_visible = true
 	live_overlay = mp.create_osd_overlay("ass-events")
 	live_cmd = mp.command_native_async({
@@ -1023,6 +1111,7 @@ function Live_stop()
 	end
 	live_items, live_chan = {}, {}
 	live_fixed, live_agg = {}, {}
+	agg_heap = {}
 	live_offset, live_file, live_room = 0, nil, nil
 	live_visible = true
 	live_danmu_open = false

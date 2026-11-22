@@ -657,6 +657,57 @@ assert(n_nomerge == 3, "live_merge=no 时应各自显示 3 条，实际 " .. n_n
 OPT.live_merge = "yes"
 print("OK: live_merge=no 时关闭聚合")
 
+-- ============ 14. 固定区排满：按「计数最少」淘汰，不是按时间 ============
+-- 场景：固定区只放得下 3 条聚合弹幕（live_merge_max=3 直接卡名额，比按行数算更可控）。
+-- A 刷到 5 条、B 3 条、C 2 条 → 三条都在屏上。
+-- 然后 D 只刷 2 条：计数 2 不大于屏上最小（2，C 也是 2），不该挤掉任何一条。
+-- D 继续刷到 3 条：大于最小(2)，应该顶掉 C（计数 2 的那条），屏上是 A5/B3/D3。
+OPT.live_merge_max = "3"
+OPT.live_merge_hold = "30"  -- 放长窗口，避免测试中途过期
+FAKE_TIME = FAKE_TIME + 60
+local function burst(text, n)
+  for i = 1, n do
+    feed(dm("u" .. i, text, 16777215, 1, 25))
+    FAKE_TIME = FAKE_TIME + 0.05
+  end
+end
+burst("HEAPA", 5)
+burst("HEAPB", 3)
+burst("HEAPC", 2)
+assert(line_with("HEAPA ×5"), "HEAPA ×5 应上屏")
+assert(line_with("HEAPB ×3"), "HEAPB ×3 应上屏")
+assert(line_with("HEAPC ×2"), "HEAPC ×2 应上屏")
+print("OK: 三条聚合弹幕上屏（5 / 3 / 2）")
+
+-- D 追到 2 条：与屏上最小并列，不该替换（要求严格大于）
+burst("HEAPD", 2)
+assert(line_with("HEAPC ×2"), "计数并列时不应淘汰（C 应仍在屏上）")
+assert(not line_with("HEAPD ×2"), "计数并列时 D 不应上屏")
+print("OK: 计数并列不替换（D=2 与最小 2 并列，未上屏）")
+
+-- D 追到 3 条：严格大于最小(2)，顶掉 C
+burst("HEAPD", 1)
+assert(line_with("HEAPD ×3"), "D 涨到 3 应顶掉计数最小的 C 上屏")
+assert(not line_with("HEAPC ×2"), "C（计数 2）应被挤下屏")
+assert(line_with("HEAPA ×5") and line_with("HEAPB ×3"),
+  "A5 / B3 不该被挤掉")
+print("OK: 按计数淘汰 —— D3 顶掉 C2，A5/B3 保留")
+
+-- C 继续涨到 4 条：严格大于当时最小(3)，应该抢回来，顶掉 B3 或 D3
+burst("HEAPC", 2)
+assert(line_with("HEAPC ×4"), "C 涨到 4 应重新抢回位置")
+assert(line_with("HEAPA ×5"), "A5（最大）不该被挤掉")
+local shown = 0
+for _, t in ipairs({ "HEAPA ×5", "HEAPB ×3", "HEAPC ×4", "HEAPD ×3" }) do
+  if line_with(t) then shown = shown + 1 end
+end
+assert(shown == 3, "同屏聚合弹幕应恒为 3 条，实际 " .. shown)
+print("OK: 被挤下去的涨回来能再上屏（C4 抢回位置，仍是最多 3 条）")
+
+OPT.live_merge_max = "10"
+OPT.live_merge_hold = "4"
+FAKE_TIME = FAKE_TIME + 60
+
 -- ============ 10. jsonl 截断 + 结束清理 ============
 assert(FAKE_FILES.jsonl == "" or FAKE_FILES.jsonl == nil, "live_trim 未截断")
 key_bindings["b"]()
