@@ -166,6 +166,10 @@ end
 local function count_pos() return select(2, overlay_data:gsub("\\pos", "")) end
 
 dofile(MAIN)
+-- 生产配置是 percent=0.85（滚动区只用顶部 15%）。桩里的 props 不参与
+-- read_options（它只抓默认表），所以这里显式设成生产值，
+-- 后面的行数 / 固定区断言才有意义。
+OPT.percent = "0.85"
 events["file-loaded"]()
 assert(spawned and spawned.args, "未启动 live_danmu.py 子进程")
 print("子进程: " .. table.concat(spawned.args, " "))
@@ -556,6 +560,102 @@ timer.fn()
 assert(overlay_data:find("钱七 保留名字", 1, true), "live_prefix=trim_keep 不对")
 OPT.live_prefix = "trim"
 print("OK: live_prefix 三种模式")
+
+-- 取包含某段文字的那一行 ASS 事件（\pos 在文字前面，不能按文字往后找）
+local function line_with(s)
+  for line in overlay_data:gmatch("[^\n]+") do
+    if line:find(s, 1, true) then return line end
+  end
+  return nil
+end
+
+-- ============ 9. 固定弹幕区：从舞台顶部算起，占整屏 50%，与滚动区重叠 ============
+-- 1080 舞台：滚动区 0..162（percent=0.85），固定区 0..540（0.5*1080），
+-- 0..162 这段两块重叠（两套独立通道，互不避让）
+OPT.live_fixed_percent = "0.5"
+FAKE_TIME = FAKE_TIME + 60
+FAKE_FILES.jsonl = dm("t", "FIXTOP", 16777215, 5, 25) .. "\n"
+timer.fn()
+local fix_line = line_with("FIXTOP")
+assert(fix_line, "顶部固定弹幕未渲染")
+local fix_y = tonumber(fix_line:match("\\pos%(%-?%d+,(%d+)%)"))
+assert(fix_y == 0, "顶部固定弹幕应落在固定区顶(0)，实际 " .. tostring(fix_y))
+FAKE_TIME = FAKE_TIME + 60
+FAKE_FILES.jsonl = dm("b", "FIXBOT", 16777215, 4, 25) .. "\n"
+timer.fn()
+local bot_line = line_with("FIXBOT")
+assert(bot_line, "底部固定弹幕未渲染")
+local bot_y = tonumber(bot_line:match("\\pos%(%-?%d+,(%d+)%)"))
+assert(bot_y == 540, "底部固定弹幕底边应落在固定区底(540)，实际 " .. tostring(bot_y))
+assert(bot_line:find("\\an2", 1, true), "底部固定弹幕应为 an2")
+print("OK: 固定区 0..540（与滚动区重叠，滚动区仍是顶部 15%）")
+
+-- ============ 10. 聚合：3 条相同 -> 1 条滚动 + 1 条固定 ×3 ============
+OPT.live_merge = "yes"
+OPT.live_merge_hold = "4"
+OPT.live_merge_min = "2"
+OPT.live_merge_maxlen = "30"
+FAKE_TIME = FAKE_TIME + 60
+local function feed(line) FAKE_FILES.jsonl = line .. "\n"; timer.fn() end
+feed(dm("u1", "SAME", 16777215, 1, 25))
+local first_line = line_with("SAME")
+assert(first_line and not first_line:find("×", 1, true),
+  "第一条应正常滚动显示（不带计数）")
+FAKE_TIME = FAKE_TIME + 0.3
+feed(dm("u2", "SAME", 16777215, 1, 25))
+FAKE_TIME = FAKE_TIME + 0.3
+feed(dm("u3", "SAME", 16777215, 1, 25))
+local agg_line = line_with("SAME ×3")
+assert(agg_line, "第 3 条应把计数更新为 ×3")
+assert(agg_line:find("\\an8", 1, true), "聚合弹幕应为顶部固定（an8）")
+assert(tonumber(agg_line:match("\\pos%(%-?%d+,(%d+)%)")) == 0,
+  "聚合弹幕应落在固定区顶(0)")
+local n_same = select(2, overlay_data:gsub("SAME", ""))
+assert(n_same == 2, "同屏应只有 2 处 SAME（1 滚动 + 1 固定），实际 " .. n_same)
+print("OK: 聚合 3 条相同 -> 1 滚动 + 1 固定 ×3（数字原地增长）")
+
+-- ============ 11. 超过 hold 后聚合弹幕消失、计数清零 ============
+FAKE_TIME = FAKE_TIME + 4.5
+feed("")
+assert(not line_with("SAME ×3"), "超过 hold 后聚合弹幕应消失")
+FAKE_TIME = FAKE_TIME + 0.2
+feed(dm("u4", "SAME", 16777215, 1, 25))
+assert(not line_with("SAME ×2"), "消失后应重新从 1 开始计数")
+print("OK: 超过 hold 后消失，再来重新计数")
+
+-- ============ 12. 固定区三方共存：聚合 + 原生顶部 + SC 各占一行 ============
+FAKE_TIME = FAKE_TIME + 60
+feed(dm("a", "AGGMIX", 16777215, 1, 25))
+FAKE_TIME = FAKE_TIME + 0.2
+feed(dm("b", "AGGMIX", 16777215, 1, 25))
+FAKE_TIME = FAKE_TIME + 0.2
+feed(dm("c", "NATIVETOP", 16777215, 5, 25))
+FAKE_TIME = FAKE_TIME + 0.2
+feed(scdm("s", "SCMIX", 16711680, 30))
+local ys = {}
+for line in overlay_data:gmatch("[^\n]+") do
+  if line:find("AGGMIX ×2", 1, true) or line:find("NATIVETOP", 1, true)
+      or line:find("SCMIX", 1, true) then
+    ys[#ys + 1] = tonumber(line:match("\\pos%(%-?%d+,(%d+)%)"))
+  end
+end
+assert(#ys == 3, "应有三条固定弹幕，实际 " .. #ys)
+assert(ys[1] ~= ys[2] and ys[2] ~= ys[3] and ys[1] ~= ys[3],
+  "三条固定弹幕落在同一行（叠字）: " .. table.concat(ys, ","))
+print("OK: 聚合/原生顶部/SC 三方共存，各占一行: " .. table.concat(ys, ","))
+
+-- ============ 13. live_merge=no 时不合并 ============
+OPT.live_merge = "no"
+FAKE_TIME = FAKE_TIME + 60
+feed(dm("x1", "NOMERGE", 16777215, 1, 25))
+FAKE_TIME = FAKE_TIME + 0.2
+feed(dm("x2", "NOMERGE", 16777215, 1, 25))
+FAKE_TIME = FAKE_TIME + 0.2
+feed(dm("x3", "NOMERGE", 16777215, 1, 25))
+local n_nomerge = select(2, overlay_data:gsub("NOMERGE", ""))
+assert(n_nomerge == 3, "live_merge=no 时应各自显示 3 条，实际 " .. n_nomerge)
+OPT.live_merge = "yes"
+print("OK: live_merge=no 时关闭聚合")
 
 -- ============ 10. jsonl 截断 + 结束清理 ============
 assert(FAKE_FILES.jsonl == "" or FAKE_FILES.jsonl == nil, "live_trim 未截断")

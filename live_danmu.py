@@ -19,6 +19,11 @@ mpv-lazy 自带 Python 无需装任何第三方包即可运行。
    "size": 25, "type": "sc", "price": 30}
   注：SC 的 mode 固定为 1（B站不提供 SC 的位置语义），实际显示方式由
   lua 侧 live_sc_mode 决定：默认 top = 顶部固定弹幕（同 B站网页）。
+  {"user": "", "text": "嗷呜", "color": 16777215, "mode": 1,
+   "size": 25, "type": "agg", "count": 35, "cycle": 1, "show_time": 2}
+  注：agg 是 B站服务端聚合弹幕 DANMU_AGGREGATION（相同内容合并展示），
+  count 是该聚合周期的累计条数（不是增量）；当前 Web 链路很少下发，
+  但仍原样透传，lua 侧按「固定弹幕 + ×N」渲染。
 
 用法：
   python live_danmu.py <room_id> <out.jsonl>
@@ -313,6 +318,24 @@ def extract_danmu(msg: dict) -> Optional[Dict]:
             return {'user': user, 'text': text, 'color': color,
                     'mode': 1, 'size': 25, 'type': 'sc',
                     'price': data.get('price', 0)}
+        if cmd == 'DANMU_AGGREGATION':
+            # B站服务端聚合弹幕：相同内容在统计周期内合并推送，
+            # aggregation_num 是累计条数（不是增量），msg 是弹幕内容。
+            data = msg.get('data') or {}
+            text = str(data.get('msg', '')).strip()
+            if not text:
+                return None
+            try:
+                count = int(data.get('aggregation_num') or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if count < 1:
+                return None
+            return {'user': '', 'text': text, 'color': 16777215,
+                    'mode': 1, 'size': 25, 'type': 'agg',
+                    'count': count,
+                    'cycle': data.get('aggregation_cycle'),
+                    'show_time': data.get('show_time')}
     except (KeyError, IndexError, TypeError, AttributeError):
         pass
     return None

@@ -27,7 +27,9 @@ local o = {
 	speed = "",
 	--静止弹幕显示的持续时间 (秒)
 	duration_still = "5",
-	--保留底部多少高度的空白区域 (取值0.0-1.0)
+	--滚动弹幕区以下保留的比例 (0.0-1.0)：滚动区 = 顶部 (1 - percent) * 舞台高。
+	--0.85 → 滚动弹幕只用上方 15%（与旧行为一致）。注意这里就是「底部留白比例」，
+	--不是「弹幕区下边界」；固定弹幕区另由 live_fixed_percent 控制，不受它影响。
 	percent = "0.75",
 	--弹幕屏蔽的关键词文件路径，支持绝对和相对路径
 	filter_file = "",
@@ -76,6 +78,25 @@ local o = {
 	live_sc_mode = "top",
 	--SC 停留秒数（仅 live_sc_mode=top 生效）。0 或留空 = 用 duration_still * 2。
 	live_sc_dur = "",
+	--固定弹幕区高度（从舞台顶部算起，占整屏高度的比例 0-1，默认 0.5）。
+	--固定弹幕（mode4 底部 / mode5 顶部 / SC / 聚合弹幕）共用这一块：顶部锚定从
+	--区顶往下排，底部锚定从区底往上排，固定弹幕之间共用一张占用表，所以互不叠字。
+	--注意它与滚动区【重叠】（0 ~ 滚动区下边界 这段两块都有）：固定弹幕和滚动弹幕
+	--是两套独立通道，互不避让，和 B站 / Danmu2Ass 的分层行为一致。
+	live_fixed_percent = "0.5",
+	--重复弹幕聚合（防刷屏）：同一条内容短时间内反复出现时，只保留一个顶部固定
+	--弹幕并在后面拼 " ×N"，N 原地增长，不再占新的行。
+	--行为对齐 B站服务端 DANMU_AGGREGATION（msg + aggregation_num）的语义。
+	live_merge = "yes",
+	--聚合统计窗口 / 固定弹幕残留时间（秒）：同一内容间隔超过它就算新的一轮；
+	--最后一次出现后也保留这么久，然后消失、计数清零。
+	live_merge_hold = "4",
+	--累计到第几条才折叠（前面的仍按普通滚动弹幕显示，保证单条观感不变）
+	live_merge_min = "2",
+	--同屏最多几条聚合弹幕（固定区不够时自动收敛；满了淘汰最久没更新的）
+	live_merge_max = "10",
+	--显示文本超过该字数不参与聚合（0 = 不限）
+	live_merge_maxlen = "30",
 	--直播自动重连：掉线 / 卡顿自愈。详见下方「直播自动重连」小节
 	live_reconnect = "yes",
 	--判定“卡顿”的阈值：paused-for-cache 持续多少秒就重载换线路
@@ -113,10 +134,16 @@ local Add_fps_vf
 -- ============ B站直播实时弹幕 ============
 -- 显示规则严格对齐点播 Danmu2Ass，保证与点播弹幕长得一样、动得一样：
 --   1) PlayRes 按视频宽高比推导（与 main.lua 传给 -s 的 dw x dh 同一算法）
---   2) percent 语义完全相同：bottomReserved = percent * dh，弹幕只排上方 dh 以内
---   3) 4 条通道（0 滚动 / 1 顶部固定 / 2 底部固定 / 3 逆向滚动）+ 像素行占用 +
---      追尾判定，等价于 TestFreeRows / MarkCommentRow
---   4) 字号沿用 B站语义（25 为标准）：fsize = fontsize * size / 25
+--   2) percent 语义与点播 -p 完全相同：底部保留 percent * dh，滚动弹幕只排上方
+--      (1 - percent) * dh（默认 0.85 → 顶部 15%），与旧行为一致
+--   3) 固定弹幕（mode4/5、SC、聚合弹幕）单独占用「固定区」：同样从舞台顶部算起，
+--      高度 live_fixed_percent * dh（默认 50%）。它与滚动区是重叠的（固定弹幕和
+--      滚动弹幕是两套独立通道，互不避让，同 Danmu2Ass 的多通道行为）；顶部锚定
+--      从区顶往下、底部锚定从区底往上，固定弹幕之间共用一张按舞台绝对行索引的
+--      占用表，所以固定弹幕彼此不重叠
+--   4) 滚动通道 2 条（0 正向 / 3 逆向），固定弹幕共用一张按舞台绝对行索引的
+--      占用表 + 像素行占用 + 追尾判定，等价于 TestFreeRows / MarkCommentRow
+--   5) 字号沿用 B站语义（25 为标准）：fsize = fontsize * size / 25
 -- 为什么不能用 \move：osd-overlay 的 event 时间被 mpv 写死
 -- （sub/osd_libass.c: event->Start=0; event->Duration=100; 且渲染恒为
 -- ass_render_frame(..., ts=0, ...)），所以 Start/End / \move 都不生效，
@@ -133,7 +160,9 @@ local live_timer = nil    -- 收取 jsonl 的定时器（与流畅度无关）
 local live_rtimer = nil   -- 重绘定时器（决定顺滑度）
 local live_offset = 0     -- jsonl 已读字节数
 local live_items = {}     -- 在屏弹幕
-local live_chan = {}      -- 通道占用表：live_chan[ch][pixel_row] = occ
+local live_chan = {}      -- 滚动通道占用表：live_chan[ch][row] = occ（ch 0/3）
+local live_fixed = {}     -- 固定区占用表：live_fixed[舞台绝对行] = occ（两个方向共用）
+local live_agg = {}       -- 重复弹幕聚合组：显示文本 -> {count, last_seen, item, ...}
 local live_visible = true
 local live_room = nil
 local live_danmu_open = false -- 直播弹幕是否处于开启状态（供 Add_fps_vf 判断）
@@ -288,10 +317,23 @@ local function live_layout()
 	end
 
 	local fs = tonumber(o.fontsize) or 50
+	-- percent = 滚动区以下保留的比例（默认 0.85 → 顶部 15% 给滚动弹幕）。
+	-- 语义是「底部留白比例」，不是「弹幕区下边界」；0.85 就是顶部 15%。
 	local pct = tonumber(o.percent) or 0.75
 	if pct < 0 then pct = 0 elseif pct > 1 then pct = 1 end
-	local bottom_reserved = math.floor(pct * dh)
-	local area_bottom = dh - bottom_reserved -- 弹幕可用区域下边界（U）
+	local scroll_bottom = dh - math.floor(pct * dh) -- 滚动区下边界（U）
+	if scroll_bottom < 1 then scroll_bottom = 1 end
+
+	-- 固定区：同样从舞台顶部算起，占整屏高度的 live_fixed_percent（默认 50%）。
+	-- 注意它与滚动区是【重叠】的（0 ~ scroll_bottom 这段两块都有），因为固定弹幕
+	-- 和滚动弹幕本来就是两套独立通道、互不避让——和 Danmu2Ass 的 4 个 rows 数组、
+	-- B站播放器的分层行为一致。固定区只是给固定弹幕一个更高的行数上限。
+	local fpct = tonumber(o.live_fixed_percent) or 0.5
+	if fpct < 0 then fpct = 0 elseif fpct > 1 then fpct = 1 end
+	local fixed_top = 0
+	local fixed_bottom = math.floor(fpct * dh)
+	if fixed_bottom > dh then fixed_bottom = dh end
+	if fixed_bottom < fixed_top then fixed_bottom = fixed_top end
 
 	return {
 		ow = ow, oh = oh,          -- overlay 的 res_x/res_y（屏幕像素）
@@ -301,7 +343,10 @@ local function live_layout()
 		sx = vw / dw,              -- 1 U 横向 = 多少屏幕像素
 		sy = vh / dh,              -- 1 U 纵向 = 多少屏幕像素（字号跟随这个）
 		fs = fs,                   -- 基准字号（U）
-		area_bottom = area_bottom, -- 下边界（U）
+		scroll_bottom = scroll_bottom, -- 滚动区下边界（U）
+		fixed_top = fixed_top,         -- 固定区上边界（U）
+		fixed_bottom = fixed_bottom,   -- 固定区下边界（U）
+		area_bottom = scroll_bottom,   -- 兼容旧字段名（滚动区下边界）
 	}
 end
 
@@ -360,7 +405,12 @@ end
 --   于是同屏密度只取决于速度和文字长度，与窗口大小、固定秒数彻底解耦。
 local function live_occ_free(occ, t, dur_ms, new_len, W, still_ms, speed)
 	if not occ then return true end
-	if occ.fixed then return (t - occ.T) >= still_ms end
+	if occ.fixed then
+		-- 固定弹幕按「自身 dur」释放。旧代码用全局 still_ms：SC 停 10s 时第 6 秒
+		-- 它的行就被判成空闲，下一条固定弹幕直接叠上去（叠字）。
+		-- 聚合弹幕寿命同样远长于 still_ms，所以这里必须用 occ.dur。
+		return (t - occ.T) >= (occ.dur or still_ms)
+	end
 	local dt = t - occ.T
 	local new_dur = dur_ms
 	local occ_dur = dur_ms
@@ -373,12 +423,13 @@ local function live_occ_free(occ, t, dur_ms, new_len, W, still_ms, speed)
 	return true
 end
 
-local function live_find_row(ch, h, t, dur_ms, new_len, W, area_bottom, still_ms, fixed, speed)
+-- 滚动通道（0 正向 / 3 逆向）：只在滚动区 [0, scroll_bottom) 内排行
+local function live_find_row(ch, h, t, dur_ms, new_len, W, scroll_bottom, still_ms, speed)
 	if not live_chan[ch] then live_chan[ch] = {} end
 	local arr = live_chan[ch]
 	local nrow = math.ceil(h)
 	local row = 0
-	while row + nrow <= area_bottom do
+	while row + nrow <= scroll_bottom do
 		local ok = true
 		for r = row, row + nrow - 1 do
 			if not live_occ_free(arr[r], t, dur_ms, new_len, W, still_ms, speed) then
@@ -390,6 +441,50 @@ local function live_find_row(ch, h, t, dur_ms, new_len, W, area_bottom, still_ms
 		row = row + 1
 	end
 	return nil
+end
+
+-- ============ 固定弹幕区 ============
+-- 固定区 [fixed_top, fixed_bottom) 由 mode4 底部、mode5 顶部、SC、聚合弹幕共用。
+-- 占用表 live_fixed 按「舞台绝对行」索引，所以两个方向天然互斥：
+--   from_top=true  → 从 fixed_top 往下找（顶部弹幕 / SC / 聚合）
+--   from_top=false → 从 fixed_bottom 往上找（底部弹幕）
+local function live_fixed_free(y, nrow, t, dur_ms, new_len, W, still_ms, speed)
+	for r = y, y + nrow - 1 do
+		if not live_occ_free(live_fixed[r], t, dur_ms, new_len, W, still_ms, speed) then
+			return false
+		end
+	end
+	return true
+end
+
+-- 在固定区找位置。from_top=true 从区顶往下（顶部弹幕/SC/聚合），
+-- false 从区底往上（底部弹幕）。占用表按舞台绝对行记，所以固定弹幕之间天然互斥。
+local function live_find_fixed_row(L, h, t, dur_ms, new_len, W, still_ms, speed,
+		from_top)
+	local nrow = math.ceil(h)
+	if nrow < 1 then nrow = 1 end
+	local top = L.fixed_top
+	if L.fixed_bottom - top < nrow then return nil end
+	if from_top then
+		for y = top, L.fixed_bottom - nrow do
+			if live_fixed_free(y, nrow, t, dur_ms, new_len, W, still_ms, speed) then
+				return y
+			end
+		end
+	else
+		for y = L.fixed_bottom - nrow, top, -1 do
+			if live_fixed_free(y, nrow, t, dur_ms, new_len, W, still_ms, speed) then
+				return y
+			end
+		end
+	end
+	return nil
+end
+
+local function live_mark_fixed(y, h, occ)
+	for i = y, y + math.ceil(h) - 1 do
+		live_fixed[i] = occ
+	end
 end
 
 local function live_mark_row(ch, row, h, occ)
@@ -408,6 +503,161 @@ local function live_sweep(t)
 			for r, occ in pairs(arr) do
 				if (t - occ.T) >= occ.dur then arr[r] = nil end
 			end
+		end
+	end
+	for y, occ in pairs(live_fixed) do
+		if (t - occ.T) >= occ.dur then live_fixed[y] = nil end
+	end
+end
+
+-- 提前释放一条弹幕占用的行（live_max 裁剪 / 聚合淘汰 / 聚合过期时用）。
+-- 只清「确实属于自己」的占用项，避免误删同一行上别人的占用。
+local function live_release(it)
+	if not it or not it.occ then return end
+	local n = math.ceil(it.fsize or 1)
+	if it.fixed then
+		for y = it.fixed_y, it.fixed_y + n - 1 do
+			if live_fixed[y] == it.occ then live_fixed[y] = nil end
+		end
+	else
+		local arr = live_chan[it.ch]
+		if arr then
+			for r = it.row, it.row + n - 1 do
+				if arr[r] == it.occ then arr[r] = nil end
+			end
+		end
+	end
+	it.occ = nil
+end
+
+-- ============ 重复弹幕聚合（防刷屏） ============
+-- 行为对齐 B站服务端 DANMU_AGGREGATION（msg + aggregation_num）的语义：
+--   * 同一条内容在 live_merge_hold 秒内反复出现 → 只保留一个「顶部固定弹幕」，
+--     文字后接 " ×N"，N 原地增长，不再占新的行（把行让给其它弹幕）
+--   * 超过 hold 没有再次出现 → 固定弹幕消失、计数清零
+--   * 第 1 条（累计不到 live_merge_min）仍按普通滚动弹幕显示，不改变单条观感
+--   * 只聚合普通滚动弹幕（mode1）；SC / 图片 / 超长文本不参与
+local function live_agg_cfg()
+	local hold = (tonumber(o.live_merge_hold) or 4) * 1000
+	if hold < 500 then hold = 500 end
+	local minc = tonumber(o.live_merge_min) or 2
+	if minc < 2 then minc = 2 end
+	local maxn = tonumber(o.live_merge_max) or 10
+	if maxn < 1 then maxn = 1 end
+	local maxlen = tonumber(o.live_merge_maxlen) or 30
+	return hold, minc, maxn, maxlen
+end
+
+local function live_agg_active()
+	local n = 0
+	for _, g in pairs(live_agg) do
+		if g.item then n = n + 1 end
+	end
+	return n
+end
+
+local function live_agg_drop(key)
+	local g = live_agg[key]
+	if not g then return false end
+	if g.item then
+		g.item.end_ms = 0 -- 立刻从本帧起不再渲染
+		live_release(g.item)
+		g.item = nil
+	end
+	live_agg[key] = nil
+	return true
+end
+
+-- 淘汰最久没有更新的聚合弹幕。只动聚合，绝不碰 SC / 原生固定弹幕。
+local function live_agg_evict_oldest()
+	local oldest_key, oldest_seen = nil, nil
+	for k, g in pairs(live_agg) do
+		if g.item and (oldest_seen == nil or g.last_seen < oldest_seen) then
+			oldest_key, oldest_seen = k, g.last_seen
+		end
+	end
+	if not oldest_key then return false end
+	return live_agg_drop(oldest_key)
+end
+
+-- 在固定区申请一行，创建聚合用的顶部固定弹幕。
+-- 从 fixed_top（= 舞台顶部）往下排：固定区与滚动区重叠是刻意设计，聚合弹幕
+-- 和滚动弹幕是两套独立通道、互不避让（同 B站顶部弹幕与滚动弹幕的关系）。
+local function live_agg_spawn(g, now_ms, L, W, still_ms, hold)
+	local _, _, maxn = live_agg_cfg()
+	if live_agg_active() >= maxn then live_agg_evict_oldest() end
+	local y = live_find_fixed_row(L, g.fsize, now_ms, hold, g.w, W,
+		still_ms, 0, true)
+	if not y and live_agg_evict_oldest() then
+		y = live_find_fixed_row(L, g.fsize, now_ms, hold, g.w, W,
+			still_ms, 0, true)
+	end
+	if not y then return nil end
+	local occ = { T = now_ms, len = g.w, fixed = true, dur = hold }
+	live_mark_fixed(y, g.fsize, occ)
+	local it = {
+		text = g.text, color_tag = g.color_tag, fsize = g.fsize,
+		an = 8, y = y, w = g.w, fixed = true,
+		born_ms = now_ms, dur_ms = hold, end_ms = now_ms + hold,
+		fixed_y = y, occ = occ, agg = true, agg_key = g.key,
+	}
+	live_items[#live_items + 1] = it
+	return it
+end
+
+-- 更新/创建聚合组。count 是该组的累计条数；force=true 时即使不到 min 也显示
+--（服务端 DANMU_AGGREGATION 已经替我们决定要聚合了）。
+-- 返回 true 表示这条弹幕已被聚合吸收，调用方不要再排行。
+local function live_agg_apply(key, base, color_tag, fsize, count,
+		now_ms, L, W, still_ms, force)
+	local hold, minc = live_agg_cfg()
+	local g = live_agg[key]
+	-- 上一轮已经过期：先把它彻底丢掉，避免复用旧 item
+	if g and (now_ms - g.last_seen) > hold then
+		live_agg_drop(key)
+		g = nil
+	end
+	if not g then
+		g = { key = key, base = base, color_tag = color_tag, fsize = fsize,
+			count = 0, last_seen = now_ms, item = nil }
+		live_agg[key] = g
+	end
+	g.color_tag = color_tag
+	g.fsize = fsize
+	g.count = count
+	g.last_seen = now_ms
+	if g.count < minc and not force then return false end
+
+	g.text = g.base .. " ×" .. tostring(g.count)
+	g.w = utf8_len(g.text) * fsize
+
+	if not g.item then
+		g.item = live_agg_spawn(g, now_ms, L, W, still_ms, hold)
+		if not g.item then
+			-- 固定区真的没位置：退回普通显示（调用方会照常排行）
+			if g.count > 1 then g.count = g.count - 1 end
+			if g.count < 1 then live_agg[key] = nil end
+			return false
+		end
+	end
+	-- 原地更新：数字变大、寿命续到 now + hold
+	g.item.text = g.text
+	g.item.w = g.w
+	g.item.dur_ms = hold
+	g.item.end_ms = now_ms + hold
+	if g.item.occ then
+		g.item.occ.T = now_ms
+		g.item.occ.dur = hold
+	end
+	return true
+end
+
+-- 过期清理：最后一次出现后超过 hold 就删组、释放行
+local function live_agg_sweep(now_ms)
+	local hold = live_agg_cfg()
+	for k, g in pairs(live_agg) do
+		if (now_ms - g.last_seen) >= hold then
+			live_agg_drop(k)
 		end
 	end
 end
@@ -526,9 +776,21 @@ local function Live_render()
 	end
 	-- 同屏上限：只保留最新的 N 条（旧弹幕已显示过，丢的是寿命尾段）。
 	-- 必须在此裁剪，否则超高密度房间里每帧拼串量会失控。
+	-- 聚合弹幕是常驻的（数量另有 live_merge_max 限制），不参与裁剪：否则在高密度
+	-- 房间里它永远是最旧的一条，会被反复丢掉。裁剪时顺手释放占用的行。
 	if #fresh > live_max_items then
-		local drop = #fresh - live_max_items
-		for i = 1, drop do table.remove(fresh, 1) end
+		local over = #fresh - live_max_items
+		local kept = {}
+		for _, it in ipairs(fresh) do
+			if over > 0 and not it.agg then
+				over = over - 1
+				it.end_ms = 0
+				live_release(it)
+			else
+				kept[#kept + 1] = it
+			end
+		end
+		fresh = kept
 		parts = {}
 		for _, it in ipairs(fresh) do
 			live_emit(parts, it, L, now_ms, font_tag, alpha)
@@ -563,6 +825,11 @@ local function Live_poll()
 	f:seek("set", live_offset)
 	local chunk = f:read("*a")
 	f:close()
+	-- 时间基准与清理必须放在「有没有新数据」之前：聚合弹幕过期、占用行释放都靠
+	-- 这里推进，否则房间安静下来后固定弹幕会一直挂着不消失。
+	local now_ms = math.floor(mp.get_time() * 1000 + 0.5)
+	live_sweep(now_ms)
+	live_agg_sweep(now_ms)
 	if not chunk or chunk == "" then Live_render() return end
 	-- 只消费以换行结尾的完整行：写入方可能正写半行，剩下半行留到下个 tick
 	local last_nl = chunk:match(".*()\n")
@@ -585,7 +852,7 @@ local function Live_poll()
 	local L = live_layout()
 	local W = L.dw
 	local fs = L.fs
-	local area_bottom = L.area_bottom
+	local scroll_bottom = L.scroll_bottom
 	local marquee_ms = (tonumber(o.duration_marquee) or 10) * 1000
 	if marquee_ms < 1000 then marquee_ms = 1000 end
 	local still_ms = (tonumber(o.duration_still) or 5) * 1000
@@ -595,29 +862,28 @@ local function Live_poll()
 	-- 长弹幕只是在屏更久；0/空 = 关闭，退回 duration_marquee 的固定秒数。
 	local speed = tonumber(o.speed) or 0
 	if speed < 0 then speed = 0 end
-	local now_ms = math.floor(mp.get_time() * 1000 + 0.5)
-	live_sweep(now_ms)
 	local MODE2CH = { [1] = 0, [4] = 2, [5] = 1, [6] = 3 }
 	local function keep_line(line)
 		local ok, d = pcall(utils.parse_json, line)
 		if not (ok and d and d.text) then return end
-		-- 预处理：默认截断到第一个冒号，去掉"用户名："前缀
-		local label = live_preprocess(d.text, d.user)
-		if not label then return end
+		local is_sc = (d.type == "sc")
+		local is_agg = (d.type == "agg")
+		-- 服务端聚合弹幕的 text 就是纯内容，不走「用户名：」前缀处理
+		local label = is_agg and tostring(d.text) or live_preprocess(d.text, d.user)
+		if not label or label == "" then return end
 		local ch = MODE2CH[tonumber(d.mode) or 1] or 0
 		local ssize = tonumber(d.size) or 25
 		local fsize = math.floor(fs * ssize / 25 + 0.5)
 		local w = utf8_len(label) * fsize -- 等价 CalculateLength(c) * size
 		local dur_ms = marquee_ms
 		local row_speed = speed
-		local is_sc = (d.type == "sc")
 		if is_sc then
 			label = string.format("[SC ¥%s]%s", tostring(d.price or "?"), label)
 			-- 文字变了要重算宽度，否则排位判定会按旧长度算
 			w = utf8_len(label) * fsize
 			if tostring(o.live_sc_mode or "top") == "top" then
 				-- SC 默认走顶部固定弹幕（对齐 B站网页播放器：钉住停留，不飘过去）。
-				-- 固定通道用 ch=1（顶部），dur 用 SC 自己的停留时长。
+				-- 固定弹幕与 mode5/聚合共用固定区，ch=1 表示「顶部锚定」。
 				ch = 1
 				dur_ms = tonumber(o.live_sc_dur) or 0
 				if dur_ms <= 0 then dur_ms = still_ms * 2 else dur_ms = dur_ms * 1000 end
@@ -635,28 +901,64 @@ local function Live_poll()
 		if dim > 0 and dim < 1 then color = live_dim_color(color, dim) end
 		local color_tag = live_color_tag(color)
 		local h = fsize -- 单行弹幕高度
+
+		-- ① 服务端聚合弹幕（DANMU_AGGREGATION）：aggregation_num 是累计值，直接覆盖
+		if is_agg then
+			local cnt = tonumber(d.count) or 0
+			if cnt >= 1 then
+				live_agg_apply(label, text, color_tag, fsize, cnt,
+					now_ms, L, W, still_ms, true)
+			end
+			return
+		end
+
+		-- ② 客户端聚合：只处理普通滚动弹幕，累计到 live_merge_min 条才折叠。
+		-- 第 1 条照常滚动显示（观感不变），第 2 条起被吸收进顶部固定弹幕。
+		if ch == 0 and not is_sc and tostring(o.live_merge or "yes") ~= "no" then
+			local hold, _, _, maxlen = live_agg_cfg()
+			if maxlen <= 0 or utf8_len(label) <= maxlen then
+				local g = live_agg[label]
+				local cnt = (g and (now_ms - g.last_seen) <= hold)
+					and (g.count + 1) or 1
+				if live_agg_apply(label, text, color_tag, fsize, cnt,
+						now_ms, L, W, still_ms) then
+					return
+				end
+			end
+		end
+
 		if ch == 1 or ch == 2 then
-			local row = live_find_row(ch, h, now_ms, dur_ms, w, W,
-				area_bottom, still_ms, true, 0)
-			if row == nil then return end -- 排不下就丢弃，保证不重叠
-			local y = (ch == 1) and row or (area_bottom - row) -- an8 顶 / an2 底
-			live_mark_row(ch, row, h,
-				{ T = now_ms, len = w, fixed = true, dur = dur_ms })
+			-- 固定区：顶部锚定（mode5 / SC / 聚合）从区顶往下，底部锚定（mode4）从区底往上
+			local from_top = (ch == 1)
+			local y = live_find_fixed_row(L, h, now_ms, dur_ms, w, W,
+				still_ms, 0, from_top)
+			-- SC / 原生顶部弹幕优先：没位置时先挤掉最久没更新的聚合弹幕再试一次
+			if not y and from_top and live_agg_evict_oldest() then
+				y = live_find_fixed_row(L, h, now_ms, dur_ms, w, W,
+					still_ms, 0, from_top)
+			end
+			if not y then return end -- 排不下就丢弃，保证不重叠
+			local occ = { T = now_ms, len = w, fixed = true, dur = dur_ms }
+			live_mark_fixed(y, h, occ)
 			live_items[#live_items + 1] = {
 				text = text, color_tag = color_tag, fsize = fsize,
-				an = (ch == 1) and 8 or 2, y = y, w = w, fixed = true,
+				an = from_top and 8 or 2,
+				-- an2 的 \pos 是文字底边，所以底部锚定要落到整块的底边
+				y = from_top and y or (y + math.ceil(h)),
+				w = w, fixed = true, occ = occ, fixed_y = y,
 				born_ms = now_ms, dur_ms = dur_ms, end_ms = now_ms + dur_ms,
 			}
 		else
 			local reverse = (ch == 3)
 			local row = live_find_row(ch, h, now_ms, dur_ms, w, W,
-				area_bottom, still_ms, false, row_speed)
+				scroll_bottom, still_ms, row_speed)
 			if row == nil then return end
-			live_mark_row(ch, row, h,
-				{ T = now_ms, len = w, fixed = false, dur = dur_ms })
+			local occ = { T = now_ms, len = w, fixed = false, dur = dur_ms }
+			live_mark_row(ch, row, h, occ)
 			live_items[#live_items + 1] = {
 				text = text, color_tag = color_tag, fsize = fsize,
 				reverse = reverse, y = row, w = w,
+				ch = ch, row = row, occ = occ,
 				born_ms = now_ms, dur_ms = dur_ms, end_ms = now_ms + dur_ms,
 			}
 		end
@@ -679,6 +981,8 @@ local function Live_start(room)
 	live_offset = 0
 	live_items = {}
 	live_chan = {}
+	live_fixed = {}
+	live_agg = {}
 	live_visible = true
 	live_overlay = mp.create_osd_overlay("ass-events")
 	live_cmd = mp.command_native_async({
@@ -718,6 +1022,7 @@ function Live_stop()
 		pcall(os.remove, live_file)
 	end
 	live_items, live_chan = {}, {}
+	live_fixed, live_agg = {}, {}
 	live_offset, live_file, live_room = 0, nil, nil
 	live_visible = true
 	live_danmu_open = false
