@@ -569,10 +569,10 @@ local function line_with(s)
   return nil
 end
 
--- ============ 9. 固定弹幕区：从舞台顶部算起，占整屏 50%，与滚动区重叠 ============
--- 1080 舞台：滚动区 0..162（percent=0.85），固定区 0..540（0.5*1080），
+-- ============ 9. 固定弹幕区：从舞台顶部算起，占整屏 30%，与滚动区重叠 ============
+-- 1080 舞台：滚动区 0..162（percent=0.85），固定区 0..324（0.3*1080），
 -- 0..162 这段两块重叠（两套独立通道，互不避让）
-OPT.live_fixed_percent = "0.5"
+OPT.live_fixed_percent = "0.3"
 FAKE_TIME = FAKE_TIME + 60
 FAKE_FILES.jsonl = dm("t", "FIXTOP", 16777215, 5, 25) .. "\n"
 timer.fn()
@@ -586,9 +586,9 @@ timer.fn()
 local bot_line = line_with("FIXBOT")
 assert(bot_line, "底部固定弹幕未渲染")
 local bot_y = tonumber(bot_line:match("\\pos%(%-?%d+,(%d+)%)"))
-assert(bot_y == 540, "底部固定弹幕底边应落在固定区底(540)，实际 " .. tostring(bot_y))
+assert(bot_y == 324, "底部固定弹幕底边应落在固定区底(324)，实际 " .. tostring(bot_y))
 assert(bot_line:find("\\an2", 1, true), "底部固定弹幕应为 an2")
-print("OK: 固定区 0..540（与滚动区重叠，滚动区仍是顶部 15%）")
+print("OK: 固定区 0..324（与滚动区重叠，滚动区仍是顶部 15%）")
 
 -- ============ 10. 聚合：3 条相同 -> 1 条滚动 + 1 条固定 ×3 ============
 OPT.live_merge = "yes"

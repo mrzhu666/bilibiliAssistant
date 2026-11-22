@@ -78,12 +78,12 @@ local o = {
 	live_sc_mode = "top",
 	--SC 停留秒数（仅 live_sc_mode=top 生效）。0 或留空 = 用 duration_still * 2。
 	live_sc_dur = "",
-	--固定弹幕区高度（从舞台顶部算起，占整屏高度的比例 0-1，默认 0.5）。
+	--固定弹幕区高度（从舞台顶部算起，占整屏高度的比例 0-1，默认 0.3）。
 	--固定弹幕（mode4 底部 / mode5 顶部 / SC / 聚合弹幕）共用这一块：顶部锚定从
 	--区顶往下排，底部锚定从区底往上排，固定弹幕之间共用一张占用表，所以互不叠字。
 	--注意它与滚动区【重叠】（0 ~ 滚动区下边界 这段两块都有）：固定弹幕和滚动弹幕
 	--是两套独立通道，互不避让，和 B站 / Danmu2Ass 的分层行为一致。
-	live_fixed_percent = "0.5",
+	live_fixed_percent = "0.3",
 	--重复弹幕聚合（防刷屏）：同一条内容短时间内反复出现时，只保留一个顶部固定
 	--弹幕并在后面拼 " ×N"，N 原地增长，不再占新的行。
 	--行为对齐 B站服务端 DANMU_AGGREGATION（msg + aggregation_num）的语义。
@@ -137,7 +137,7 @@ local Add_fps_vf
 --   2) percent 语义与点播 -p 完全相同：底部保留 percent * dh，滚动弹幕只排上方
 --      (1 - percent) * dh（默认 0.85 → 顶部 15%），与旧行为一致
 --   3) 固定弹幕（mode4/5、SC、聚合弹幕）单独占用「固定区」：同样从舞台顶部算起，
---      高度 live_fixed_percent * dh（默认 50%）。它与滚动区是重叠的（固定弹幕和
+--      高度 live_fixed_percent * dh（默认 30%）。它与滚动区是重叠的（固定弹幕和
 --      滚动弹幕是两套独立通道，互不避让，同 Danmu2Ass 的多通道行为）；顶部锚定
 --      从区顶往下、底部锚定从区底往上，固定弹幕之间共用一张按舞台绝对行索引的
 --      占用表，所以固定弹幕彼此不重叠
@@ -324,11 +324,11 @@ local function live_layout()
 	local scroll_bottom = dh - math.floor(pct * dh) -- 滚动区下边界（U）
 	if scroll_bottom < 1 then scroll_bottom = 1 end
 
-	-- 固定区：同样从舞台顶部算起，占整屏高度的 live_fixed_percent（默认 50%）。
+	-- 固定区：同样从舞台顶部算起，占整屏高度的 live_fixed_percent（默认 30%）。
 	-- 注意它与滚动区是【重叠】的（0 ~ scroll_bottom 这段两块都有），因为固定弹幕
 	-- 和滚动弹幕本来就是两套独立通道、互不避让——和 Danmu2Ass 的 4 个 rows 数组、
 	-- B站播放器的分层行为一致。固定区只是给固定弹幕一个更高的行数上限。
-	local fpct = tonumber(o.live_fixed_percent) or 0.5
+	local fpct = tonumber(o.live_fixed_percent) or 0.3
 	if fpct < 0 then fpct = 0 elseif fpct > 1 then fpct = 1 end
 	local fixed_top = 0
 	local fixed_bottom = math.floor(fpct * dh)
